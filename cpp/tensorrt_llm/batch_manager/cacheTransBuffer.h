@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,13 +17,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -47,72 +50,48 @@ public:
     size_t getSize() const;
 
     static size_t getAlignedSize(size_t size);
-    static bool supportFbaricMemory();
+    static bool supportFabricMemory();
 
 private:
     class Impl;
     std::unique_ptr<Impl> pImpl;
 };
 
-class CacheTransBufferManager
+/// @brief KV Cache specific transfer buffer manager.
+class CacheTransBufferManager : public BaseTransBufferManager
 {
 public:
-    CacheTransBufferManager(
-        KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens = std::nullopt);
+    CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+        std::optional<size_t> maxNumTokens = std::nullopt, bool transferIndexerKCache = false);
 
     static size_t preAllocBufferSize(std::map<SizeType32, SizeType32> const& cacheSizeBytesPerTokenPerWindow,
+        SizeType32 tokensPerBlock,
         std::optional<executor::CacheTransceiverConfig> const& cacheTransceiverConfig = std::nullopt);
 
-    std::optional<int> assignBufferIndexForSend();
-    void freeBufferIndexForSend(std::optional<int> bufferId);
-    std::optional<int> assignBufferIndexForRecv();
-    void freeBufferIndexForRecv(std::optional<int> bufferId);
+    /// @brief Get the KV cache manager.
+    [[nodiscard]] KVCacheManager::BaseKVCacheManager* getCacheManager() const noexcept
+    {
+        return mCacheManager;
+    }
 
-    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateSendBuffers(
-        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
-        runtime::BufferManager const& bufferManagerToUse);
+    /// @brief Get the data type used by KV cache transfer buffers.
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const noexcept
+    {
+        return mDataType;
+    }
 
-    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateRecvBuffers(
-        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& targetBufferEleSizes,
-        runtime::BufferManager const& bufferManagerToUse);
-
-    runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
-    runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
-    size_t getRecvBufferCount();
-    size_t getSendBufferCount();
+    [[nodiscard]] BufferKind getBufferKind() const override
+    {
+        return mTransferIndexerKCache ? BufferKind::kKV_INDEXER : BufferKind::kKV;
+    }
 
 private:
-    struct ConcurrenceResource
-    {
-        std::unordered_map<int, runtime::ITensor::SharedPtr> mBuffers;
-        std::vector<int> mBufferIndexFlag;
-        std::mutex mBuffersMutex;
-        std::condition_variable mBuffersCV;
-        std::atomic<int> mConcurrence = 0;
-    };
+    /// @brief Compute transfer buffer size from KV cache configuration.
+    static size_t computeTransferBufferSize(KVCacheManager::BaseKVCacheManager* cacheManager,
+        std::optional<size_t> maxNumTokens, bool transferIndexerKCache);
 
-    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
-        int targetNum, std::vector<size_t> const& targetBufferEleSizes,
-        runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
-
-    void allocateBuffer();
-    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
-    void freeBufferIndex(
-        ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
-
-    size_t mPreAllocBufferSize;
-    size_t mRecvBufferCount;
-    size_t mSendBufferCount;
-    size_t mTransferBufferSize;
-    bool mOnlyUseDynamicBuffer;
-    bool mUseFabricMemory;
-    size_t mBufferEleSize;
-    nvinfer1::DataType mDataType;
-    ConcurrenceResource mConcurrenceSendResource;
-    ConcurrenceResource mConcurrenceRecvResource;
     KVCacheManager::BaseKVCacheManager* mCacheManager;
-    runtime::BufferManager mBufferManager;
-    std::vector<std::unique_ptr<FabricMemory>> mFabricMemory;
+    bool mTransferIndexerKCache;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

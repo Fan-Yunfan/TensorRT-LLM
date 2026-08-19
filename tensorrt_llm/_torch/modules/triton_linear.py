@@ -1,23 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
+from triton_kernels.matmul import FlexCtx, PrecisionConfig, matmul
+from triton_kernels.numerics import InFlexData
 
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
-# Reuse the common Triton import setup
-from .fused_moe.fused_moe_triton import (IS_TRITON_KERNELS_AVAILABLE,
-                                         maybe_update_stride,
-                                         swizzle_weight_and_scale)
-
-if IS_TRITON_KERNELS_AVAILABLE:
-    from triton_kernels.matmul_ogs import (FlexCtx, PrecisionConfig, matmul_ogs)
-    from triton_kernels.numerics import InFlexData
-
+from .fused_moe.fused_moe_triton import (swizzle_weight_and_scale,
+                                         update_weight_stride)
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
                      WeightsLoadingConfig, copy_weight, load_weight_shard,
                      load_weights_fused_gate_up_helper,
@@ -49,18 +59,15 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        output = matmul_ogs(
-            input,
-            module.weight,
-            module.bias,
-            None,  # Routing data is not used here
-            gather_indx=None,
-            precision_config=None)
+        output = matmul(input,
+                        module.weight,
+                        module.bias,
+                        precision_config=None)
         return output
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights, **self.param_transform)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -70,7 +77,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (q_weight, k_weight, v_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -80,7 +87,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (gate_weight, up_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
 
 class TritonFP8QDQLinearMethod(LinearMethodBase):
@@ -135,13 +142,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
         pc = PrecisionConfig(flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)
-        output = matmul_ogs(
-            qinput,
-            module.weight,
-            module.bias,
-            None,  # Routing data is not used here
-            gather_indx=None,
-            precision_config=pc)
+        output = matmul(qinput, module.weight, module.bias, precision_config=pc)
         return output
 
     def load_weight_scales(self, weights: List[Dict]):
@@ -163,7 +164,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             # Dynamic quantization
             module.input_scale = None
         copy_weight(module.weight_scale, weight_scale[0])
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -188,7 +189,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -211,7 +212,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_update_stride(module.weight.data)
+        module.weight.data = update_weight_stride(module.weight.data)
 
 
 class TritonMXFP4LinearMethod(LinearMethodBase):
@@ -275,17 +276,11 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
             flex_ctx = FlexCtx(lhs_data=InFlexData(scale=input_scale), )
         else:
             flex_ctx = FlexCtx()
-        pc = PrecisionConfig(weight_scale=module.weight_scale,
+        pc = PrecisionConfig(b_mx_scale=module.weight_scale,
                              flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)
-        output = matmul_ogs(
-            input,
-            module.weight,
-            module.bias,
-            None,  # Routing data is not used here
-            gather_indx=None,
-            precision_config=pc)
+        output = matmul(input, module.weight, module.bias, precision_config=pc)
         return output
 
     def load_weights_common(self, module: Linear, weights_list: List[Dict]):
@@ -324,7 +319,8 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
             0)  # (1, in_features//32, out_features)
         fused_weight, fused_scale = swizzle_weight_and_scale(
             fused_weight, fused_scale)
-        assert module.weight_scale.dtype == fused_scale.dtype
+        # Tensor.dtype is a Triton type; compare the underlying torch dtype.
+        assert module.weight_scale.dtype == fused_scale.storage.data.dtype
         # We need to use Triton tensor wrapper instead of Torch tensor to maintain the correct swizzling layout
         module._parameters.pop('weight', None)
         module._parameters.pop('weight_scale', None)
@@ -383,9 +379,6 @@ class TritonLinear(Linear):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            raise ImportError("Triton kernels are not available. "
-                              "Please install the required dependencies.")
         assert not use_custom_cublas_mm, "TritonLinear does not support custom cublas mm."
 
         super().__init__(

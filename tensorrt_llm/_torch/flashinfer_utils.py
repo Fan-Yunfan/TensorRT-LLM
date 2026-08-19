@@ -7,13 +7,13 @@ from ..logger import logger
 IS_FLASHINFER_AVAILABLE = False
 
 
-def get_env_enable_pdl():
-    return os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
+def get_env_enable_pdl() -> bool:
+    enabled = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    if enabled and not getattr(get_env_enable_pdl, "_printed", False):
+        logger.info("PDL enabled")
+        setattr(get_env_enable_pdl, "_printed", True)
+    return enabled
 
-
-ENABLE_PDL = get_env_enable_pdl()
-if ENABLE_PDL:
-    logger.info("PDL is enabled")
 
 if platform.system() != "Windows":
     try:

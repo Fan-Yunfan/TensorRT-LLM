@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #if ENABLE_BF16
 #include <cuda_bf16.h>
 #endif // ENABLE_BF16
@@ -25,10 +26,13 @@
 #include <memory>  // std::make_unique
 #include <sstream> // std::stringstream
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 #if ENABLE_BF16
 static inline std::basic_ostream<char>& operator<<(std::basic_ostream<char>& stream, __nv_bfloat16 const& val)
@@ -228,4 +232,6 @@ inline void toUpper(std::string& s)
     }
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

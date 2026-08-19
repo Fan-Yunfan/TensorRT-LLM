@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -93,7 +93,9 @@ void initMoeBindings(nb::module_& m)
         .def("get_pointer", &tr::SingleLayerMoeLoadBalancer::getSelfPtr,
             "Get the pointer of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>())
         .def("get_layer_id", &tr::SingleLayerMoeLoadBalancer::getLayerId,
-            "Get the layer id of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>());
+            "Get the layer id of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>())
+        .def("get_old_rank_expert_ids", &tr::SingleLayerMoeLoadBalancer::getOldRankExpertIds,
+            "Get the old rank expert ids of the SingleLayerMoeLoadBalancer", nb::call_guard<nb::gil_scoped_release>());
 
     // Bind MoeLoadBalancer class
     nb::class_<tr::MoeLoadBalancer>(m, "MoeLoadBalancer")
@@ -114,6 +116,9 @@ void initMoeBindings(nb::module_& m)
             nb::arg("enable_update_weights"), "Start a new iteration with the given ID and settings",
             nb::call_guard<nb::gil_scoped_release>())
         .def("end_iter", &tr::MoeLoadBalancer::endIter, nb::arg("iter_id"), "End the iteration with the given ID",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("reconfigure_mask_only", &tr::MoeLoadBalancer::reconfigureMaskOnly, nb::arg("dead_ranks"),
+            "Reconfigure EPLB routing metadata so slots on dead EP ranks are unreachable",
             nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
             nb::call_guard<nb::gil_scoped_release>());

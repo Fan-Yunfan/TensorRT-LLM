@@ -15,13 +15,12 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
-
+TRTLLM_NAMESPACE_BEGIN
 enum class QuantizationSFLayout
 {
     // Block scale factors are stored in swizzled layout for cutlass FP4 kernel. Scale factor
@@ -92,5 +91,17 @@ template <typename T>
 void computePerTokenGlobalScaleForFP4Quantization(int b, int m, int n, T const* input, int const* tokensPerBatch,
     float* globalScale, int multiProcessorCount, cudaStream_t stream = 0);
 
+// Unpack a packed int4 tensor (two signed 4-bit values per byte) into int8.
+// output must have 2 * numPacked elements.
+void invokeUnpackInt4PackedTensorToInt8(
+    int8_t* output, int8_t const* input, int64_t numPacked, cudaStream_t stream = 0);
+
+// Dequantize an unswizzled MXFP4 weight (two e2m1 values per byte) using a linear-layout
+// e8m0 block scale. output must have 2 * numPacked floats.
+// k is the unpacked column count (weight.size(1) * 2), scaleStride is scale.size(1).
+void invokeMxfp4DequantizeUnswizzled(float* output, uint8_t const* weight, uint8_t const* scale, int64_t numPacked,
+    int64_t k, int64_t scaleStride, int64_t groupSize, cudaStream_t stream = 0);
+
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

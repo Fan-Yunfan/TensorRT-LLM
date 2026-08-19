@@ -16,7 +16,6 @@
  */
 
 #include "bindings.h"
-#include "executor.h"
 #include "executorConfig.h"
 #include "request.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -63,15 +62,15 @@ void initBindings(nb::module_& m)
         new (&self) tle::DecodingMode(nb::cast<tle::DecodingMode::UnderlyingType>(state[0]));
     };
     nb::class_<tle::DecodingMode>(m, "DecodingMode")
-        .def("Auto", &tle::DecodingMode::Auto)
-        .def("TopK", &tle::DecodingMode::TopK)
-        .def("TopP", &tle::DecodingMode::TopP)
-        .def("TopKTopP", &tle::DecodingMode::TopKTopP)
-        .def("BeamSearch", &tle::DecodingMode::BeamSearch)
-        .def("Medusa", &tle::DecodingMode::Medusa)
-        .def("Lookahead", &tle::DecodingMode::Lookahead)
-        .def("ExplicitDraftTokens", &tle::DecodingMode::ExplicitDraftTokens)
-        .def("Eagle", &tle::DecodingMode::Eagle)
+        .def_static("Auto", &tle::DecodingMode::Auto)
+        .def_static("TopK", &tle::DecodingMode::TopK)
+        .def_static("TopP", &tle::DecodingMode::TopP)
+        .def_static("TopKTopP", &tle::DecodingMode::TopKTopP)
+        .def_static("BeamSearch", &tle::DecodingMode::BeamSearch)
+        .def_static("Medusa", &tle::DecodingMode::Medusa)
+        .def_static("Lookahead", &tle::DecodingMode::Lookahead)
+        .def_static("ExplicitDraftTokens", &tle::DecodingMode::ExplicitDraftTokens)
+        .def_static("Eagle", &tle::DecodingMode::Eagle)
         .def("isAuto", &tle::DecodingMode::isAuto)
         .def("isTopK", &tle::DecodingMode::isTopK)
         .def("isTopP", &tle::DecodingMode::isTopP)
@@ -94,7 +93,8 @@ void initBindings(nb::module_& m)
 
     nb::enum_<tle::ContextChunkingPolicy>(m, "ContextChunkingPolicy")
         .value("EQUAL_PROGRESS", tle::ContextChunkingPolicy::kEQUAL_PROGRESS)
-        .value("FIRST_COME_FIRST_SERVED", tle::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+        .value("FIRST_COME_FIRST_SERVED", tle::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED)
+        .value("FORCE_CHUNK", tle::ContextChunkingPolicy::kFORCE_CHUNK);
 
     nb::enum_<tle::CommunicationType>(m, "CommunicationType").value("MPI", tle::CommunicationType::kMPI);
 
@@ -130,7 +130,14 @@ void initBindings(nb::module_& m)
         .def_rw("num_paused_requests", &tle::InflightBatchingStats::numPausedRequests)
         .def_rw("num_ctx_tokens", &tle::InflightBatchingStats::numCtxTokens)
         .def_rw("micro_batch_id", &tle::InflightBatchingStats::microBatchId)
-        .def_rw("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter);
+        .def_rw("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter)
+        .def_rw("num_ctx_kv_tokens", &tle::InflightBatchingStats::numCtxKvTokens)
+        .def_rw("num_gen_kv_tokens", &tle::InflightBatchingStats::numGenKvTokens)
+        .def_rw("num_queued_context_requests", &tle::InflightBatchingStats::numQueuedContextRequests)
+        .def_rw("num_queued_ctx_tokens", &tle::InflightBatchingStats::numQueuedCtxTokens)
+        .def_rw("num_queued_gen_requests", &tle::InflightBatchingStats::numQueuedGenRequests)
+        .def_rw("num_queued_gen_kv_tokens", &tle::InflightBatchingStats::numQueuedGenKvTokens)
+        .def_rw("num_paused_kv_tokens", &tle::InflightBatchingStats::numPausedKvTokens);
 
     nb::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")
         .def(nb::init<>())
@@ -221,7 +228,28 @@ void initBindings(nb::module_& m)
         .def_ro("tokens", &tle::KVCacheStoredBlockData::tokens)
         .def_ro("lora_id", &tle::KVCacheStoredBlockData::loraId)
         .def_ro("cache_level", &tle::KVCacheStoredBlockData::cacheLevel)
-        .def_ro("priority", &tle::KVCacheStoredBlockData::priority);
+        .def_ro("priority", &tle::KVCacheStoredBlockData::priority)
+        .def_ro("cache_salt", &tle::KVCacheStoredBlockData::cacheSalt)
+        .def_prop_ro("mm_keys",
+            [](tle::KVCacheStoredBlockData const& self)
+            {
+                // Convert std::vector<MmKey> to Python list of tuples (bytes, int, optional<str>)
+                // MmKey = struct { hash, startOffset, uuid }
+                nb::list result;
+                for (auto const& mmKey : self.mmKeys)
+                {
+                    nb::bytes hashBytes(reinterpret_cast<char const*>(mmKey.hash.data()), mmKey.hash.size());
+                    if (mmKey.uuid.has_value())
+                    {
+                        result.append(nb::make_tuple(hashBytes, mmKey.startOffset, mmKey.uuid.value()));
+                    }
+                    else
+                    {
+                        result.append(nb::make_tuple(hashBytes, mmKey.startOffset, nb::none()));
+                    }
+                }
+                return result;
+            });
 
     nb::class_<tle::KVCacheStoredData>(executor_kv_cache, "KVCacheStoredData")
         .def_ro("parent_hash", &tle::KVCacheStoredData::parentHash)
@@ -258,7 +286,6 @@ void initBindings(nb::module_& m)
 
     tensorrt_llm::nanobind::executor::initRequestBindings(m);
     tensorrt_llm::nanobind::executor::initConfigBindings(m);
-    tensorrt_llm::nanobind::executor::Executor::initBindings(m);
 }
 
 } // namespace tensorrt_llm::nanobind::executor

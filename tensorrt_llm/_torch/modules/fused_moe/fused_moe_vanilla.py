@@ -10,12 +10,78 @@ from tensorrt_llm.quantization.utils import fp4_utils
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
+from ...utils import ActivationType, is_gated_activation, relu2
 from ..gated_mlp import GatedMLP
-from .interface import MoEWeightLoadingMode
+from ..mlp import MLP
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
+                            MoERejectReason, MoEStaticCapability)
+from .interface import MoEWeightLoadingMode, _reject
 from .routing import BaseMoeRoutingMethod
 
 
 class VanillaMoE(nn.ModuleList):
+
+    #: Declared explicitly because the resolver may return this ModuleList.
+    capabilities = MoEStaticCapability()
+
+    #: Quantization labels supported by the Linear dispatcher.
+    _SUPPORTED_QUANT_LABELS = frozenset({
+        "FP8",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "FP8_BLOCK_SCALES",
+        "NVFP4",
+        "W4A16_NVFP4",
+        "W4A8_NVFP4_FP8",
+        "W4A8_MXFP4_FP8",
+        "W4A8_MXFP4_MXFP8",
+        "MXFP8",
+        "W8A16",
+        "W4A16",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+    })
+
+    @classmethod
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Check whether the PyTorch reference path has the required plumbing."""
+        if p.quant is not None and p.quant not in cls._SUPPORTED_QUANT_LABELS:
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
+                f"VanillaMoE dequantizes through Linear, which has no "
+                f"quant method for {p.quant}")
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "VanillaMoE has no bias / swiglu alpha-beta-limit parameters")
+        activation = p.activation_type
+        if (not is_gated_activation(activation)
+                and activation != ActivationType.Relu2):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"VanillaMoE builds non-gated experts as MLP, whose only "
+                f"non-gated activation is Relu2 (got {p.activation})")
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "VanillaMoE holds expert weights as plain submodules and "
+                "cannot expose them as migratable EPLB slots")
+        if d.smart_router:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"VanillaMoE has no smart-router path (moe_cluster_size="
+                f"{d.cluster_size})")
+        # Uniform partitioning only. ``MoE._compute_ep_partition`` would hand a
+        # non-divisible count a ceil/floor split that this backend's local
+        # expert range does not implement, so it would produce wrong ranges
+        # rather than fail.
+        if (p.num_experts is not None and d.ep_size > 0
+                and p.num_experts % d.ep_size != 0):
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"VanillaMoE partitions experts uniformly, so num_experts "
+                f"({p.num_experts}) must be divisible by ep_size "
+                f"({d.ep_size})")
+        return MoEEligibility.ok()
 
     def __init__(
         self,
@@ -31,6 +97,8 @@ class VanillaMoE(nn.ModuleList):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         pack_weights: bool = False,
+        layer_idx: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         from ...distributed import AllReduce
 
@@ -41,6 +109,17 @@ class VanillaMoE(nn.ModuleList):
         self.intermediate_size = intermediate_size
         self.weight_loading_mode = weight_loading_mode
         self.pack_weights = pack_weights
+        self.layer_idx = layer_idx
+
+        self.activation_type = activation_type
+        self.is_gated_activation = is_gated_activation(activation_type)
+        # Activation eligibility (gated vs Relu2-only non-gated) is owned by
+        # ``can_implement``. ``pack_weights`` is a construction option that is
+        # not part of the problem/deployment question, so keep it here.
+        if not self.is_gated_activation and pack_weights:
+            raise ValueError(
+                "pack_weights must be False for non-gated activations. Otherwise please update `create_weights`."
+            )
 
         self.dtype = dtype
         self.reduce_results = reduce_results
@@ -51,9 +130,8 @@ class VanillaMoE(nn.ModuleList):
         self.cluster_rank = model_config.mapping.moe_cluster_rank
         self.cluster_size = model_config.mapping.moe_cluster_size
         self.smart_router = True if self.cluster_size > 1 else False
-        assert not self.smart_router, (
-            "Smart router is not supported in vanilla MoE, "
-            "please set moe_cluster_size to 1.")
+        # Smart-router / non-divisible EP eligibility is owned by
+        # ``can_implement``.
 
         self.rank = model_config.mapping.rank
 
@@ -81,9 +159,9 @@ class VanillaMoE(nn.ModuleList):
             self.num_experts)
         self.expert_size_per_partition = self.expert_end - self.expert_start
 
-        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
+        # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
+        # The default value is max_num_tokens * dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -107,14 +185,26 @@ class VanillaMoE(nn.ModuleList):
         )
         for expert_idx in range(self.num_experts):
             if self.expert_start <= expert_idx < self.expert_end:
-                module_list[expert_idx] = GatedMLP(
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    bias=False,
-                    dtype=self.dtype,
-                    config=model_config,
-                    reduce_output=False,
-                )
+                if self.activation_type == ActivationType.Relu2:
+                    module_list[expert_idx] = MLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=False,
+                        activation=relu2,
+                        dtype=self.dtype,
+                        config=model_config,
+                        layer_idx=self.layer_idx,
+                    )
+                else:
+                    module_list[expert_idx] = GatedMLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=False,
+                        dtype=self.dtype,
+                        config=model_config,
+                        reduce_output=False,
+                        layer_idx=self.layer_idx,
+                    )
             else:
                 # use identity as placeholder for unused experts
                 module_list[expert_idx] = nn.Identity()
@@ -416,9 +506,12 @@ class VanillaMoE(nn.ModuleList):
         packed_weight = packed_weight.view(len(weights), *weights_data[0].shape)
         getattr(self, f"{module_name}_{weight_name}").data = packed_weight
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         from ...models.modeling_utils import filter_weights
 
+        assert not allow_partial_loading, "Partial loading is not supported for vanilla MoE now"
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
@@ -492,6 +585,7 @@ class VanillaMoE(nn.ModuleList):
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         **kwargs,
@@ -500,7 +594,7 @@ class VanillaMoE(nn.ModuleList):
         x = x.view(-1, self.hidden_size)
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
 
         if self.use_dp and self.parallel_size > 1:
             x, token_selected_experts, token_final_scales = allgather(

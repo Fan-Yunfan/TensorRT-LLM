@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include <list>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -81,6 +82,25 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
 
 } // anonymous namespace
 
+bool appliesRoPEInXqaKernel(XQAParams const& xqaParams, bool isQGMMAKernel)
+{
+    // In-kernel RoPE is only implemented by the Hopper QGMMA kernel, and only for non-spec-dec, non-MLA
+    // cases.
+    if (!isQGMMAKernel || xqaParams.multi_query_tokens || xqaParams.isMLA())
+    {
+        return false;
+    }
+    // The in-kernel RoPE rotates the first rotary_embedding_dim head elements and copies the rest
+    // unrotated; it requires the rope region to be 16B-aligned for any supported cache dtype
+    // (rotary_embedding_dim a multiple of 16). Unsupported shapes fall back to invokeQKVPreprocessing.
+    bool const isSupportedRotary = xqaParams.rotary_embedding_dim > 0
+        && xqaParams.rotary_embedding_dim <= xqaParams.head_size && xqaParams.rotary_embedding_dim % 16 == 0;
+    return isSupportedRotary
+        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
+                                              PositionEmbeddingType::kROPE_GPTJ},
+            xqaParams.position_embedding_type);
+}
+
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
 {
     if (!supportConfigCommon(xqaParams, forConfigurePlugin))
@@ -95,8 +115,14 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_E4M3}, xqaParams.kv_cache_data_type))
     {
+        return false;
+    }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (!is_skip_softmax && xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    {
+        // Only use hopper kernel with fp16/bf16 kv cache data type when skip softmax is enabled
         return false;
     }
     if (xqaParams.beam_width != 1)
@@ -167,6 +193,11 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     {
         return false;
     }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (is_skip_softmax)
+    {
+        return false;
+    }
     return true;
 }
 
@@ -200,9 +231,15 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (is_skip_softmax)
+    {
+        return false;
+    }
     return true;
 }
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

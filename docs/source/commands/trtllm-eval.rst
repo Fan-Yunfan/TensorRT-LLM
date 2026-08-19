@@ -44,6 +44,16 @@ The following tasks are currently supported:
      - accuracy
      - 1,024
      - 512
+   * - AIME 2025
+     - QA; regex matching
+     - accuracy
+     - 4,096
+     - 32,768
+   * - AIME 2026
+     - QA; regex matching
+     - accuracy
+     - 4,096
+     - 32,768
 
 .. note::
 
@@ -73,11 +83,19 @@ Here are some examples:
    # Evaluate Llama-3.3-70B-Instruct on GPQA Diamond
    trtllm-eval --model meta-llama/Llama-3.3-70B-Instruct gpqa_diamond
 
+   # Evaluate a model on AIME 2025 / 2026 (long-CoT math; requires --max_seq_len >= 36864)
+   trtllm-eval --model <model> --max_seq_len 36864 aime25
+   trtllm-eval --model <model> --max_seq_len 36864 aime26
+
 The ``--model`` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, ``trtllm-eval`` runs the model with the PyTorch backend; you can pass ``--backend tensorrt`` to switch to the TensorRT backend.
 
 Alternatively, the ``--model`` argument also accepts a local path to pre-built TensorRT engines. In this case, you should pass the Hugging Face tokenizer path to the ``--tokenizer`` argument.
 
 For more details, see ``trtllm-eval --help`` and ``trtllm-eval <task> --help``.
+
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
 
 
 

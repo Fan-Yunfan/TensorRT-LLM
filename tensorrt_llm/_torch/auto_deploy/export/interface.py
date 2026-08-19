@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """The interface for all export patches.
 
 This module defines the base classes and interfaces for all export patches.
@@ -32,6 +46,15 @@ class ExportPatchConfig(BaseModel):
     skip_on_error: bool = Field(
         default=False,
         description="Whether to skip the patch if an error occurs during application.",
+    )
+
+
+class DisabledExportPatchConfig(ExportPatchConfig):
+    """Standard configuration for an export patch that is disabled by default."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to enable this patch.",
     )
 
 
@@ -128,6 +151,17 @@ class BaseExportPatch(ABC):
     def _revert_patch(self):
         """Revert the patch using stored original values."""
         pass
+
+
+class DisabledBaseExportPatch(BaseExportPatch):
+    """A base class for export patches that are disabled by default."""
+
+    config: DisabledExportPatchConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[ExportPatchConfig]:
+        """Get the configuration class for the patch."""
+        return DisabledExportPatchConfig
 
 
 class ContextManagerPatch(BaseExportPatch):

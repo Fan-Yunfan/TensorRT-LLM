@@ -23,7 +23,7 @@ The `LLM()` constructor accepts either a Hugging Face model ID or a local model 
 
 ### 1. Using a Model from the Hugging Face Hub
 
-To load a model directly from the [Hugging Face Model Hub]((https://huggingface.co/)), simply pass its model ID (i.e., repository name) to the LLM constructor. The model will be automatically downloaded:
+To load a model directly from the [Hugging Face Model Hub](https://huggingface.co/), simply pass its model ID (i.e., repository name) to the LLM constructor. The model will be automatically downloaded:
 
 ```python
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -46,7 +46,7 @@ Then, load the model by specifying a local directory path:
 llm = LLM(model=<local_path_to_model>)
 ```
 
-> **Note:** Some models require accepting specific [license agreements]((https://ai.meta.com/resources/models-and-libraries/llama-downloads/)). Make sure you have agreed to the terms and authenticated with Hugging Face before downloading.
+> **Note:** Some models require accepting specific [license agreements](https://ai.meta.com/resources/models-and-libraries/llama-downloads/). Make sure you have agreed to the terms and authenticated with Hugging Face before downloading.
 
 
 ## Tips and Troubleshooting
@@ -71,11 +71,26 @@ The following tips typically assist new LLM API users who are familiar with othe
 
   This limitation is applicable for multi-GPU inference only.
 
+### FlashInfer JIT workspace for dynamically spawned MPI workers
+
+When the LLM API dynamically spawns multiple MPI workers, users affected by
+concurrent FlashInfer source-generation races can enable persistent, per-worker
+cache slots for FlashInfer JIT artifacts. Set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1` before creating the LLM instance.
+The workaround preserves compiled artifacts between launches, and downloaded
+cubins remain in FlashInfer's shared cache. It is disabled by default and can
+be removed once FlashInfer guards source generation before writing shared
+workspace files.
+
+An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence. Workers
+started outside the LLM API's dynamic MPI pool must configure their own
+workspace isolation.
+
 ### Cannot quit after generation
 
   The LLM instance manages threads and processes, which may prevent its reference count from reaching zero. To address this issue, there are two common solutions:
   1. Wrap the LLM instance in a function, as demonstrated in the quickstart guide. This will reduce the reference count and trigger the shutdown process.
-  2. Use LLM as an contextmanager, with the following code: `with LLM(...) as llm: ...`, the shutdown methed will be invoked automatically once it goes out of the `with`-statement block.
+  2. Use LLM as a context manager, with the following code: `with LLM(...) as llm: ...`, the shutdown method will be invoked automatically once it goes out of the `with`-statement block.
 
 ### Single node hanging when using `docker run --net=host`
 

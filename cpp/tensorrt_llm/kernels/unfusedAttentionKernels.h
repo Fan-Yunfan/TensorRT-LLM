@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,9 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -25,8 +28,8 @@
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -66,6 +69,18 @@ enum class KvCacheDataType
     FP8,
     NVFP4
 };
+
+inline KvCacheDataType cacheTypeFromQuantMode(common::QuantMode quantMode)
+{
+    if (quantMode.hasInt8KvCache())
+        return KvCacheDataType::INT8;
+    else if (quantMode.hasFp8KvCache())
+        return KvCacheDataType::FP8;
+    else if (quantMode.hasFp4KvCache())
+        return KvCacheDataType::NVFP4;
+    else
+        return KvCacheDataType::BASE;
+}
 
 enum class RotaryPositionEmbeddingType
 {
@@ -148,6 +163,10 @@ struct QKVPreprocessingParams
     int const* cu_seq_lens{nullptr};
     // list of cumulative KV sequence lengths, of shape {batch_size + 1}, used by cross attention only.
     int const* cu_kv_seq_lens{nullptr};
+    // list of cumulative length of sparse KV indices, of shape {batch_size + 1}
+    int const* sparse_kv_offsets{nullptr};
+    // list of sparse KV indices for writing to KV cache, of shape {num_kv_heads, num_sparse_kv_indices}
+    int const* sparse_kv_indices{nullptr};
     // inverse frequencies (angle raised at various powers) from the RoPE formula
     // shape of {batch_size , rotaryEmbeddingDim / 2}
     float const* rotary_embedding_inv_freq{nullptr};
@@ -158,6 +177,9 @@ struct QKVPreprocessingParams
 
     float2 const* mrope_rotary_cos_sin{nullptr};
     int32_t const* mrope_position_deltas{nullptr};
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets{nullptr};
+    bool const* helix_is_inactive_rank{nullptr};
 
     // Scalars.
     int batch_size{0};
@@ -167,6 +189,7 @@ struct QKVPreprocessingParams
     int sink_token_len{0};
     int token_num{0};
     bool remove_padding{true};
+    bool is_last_chunk{true};
     bool cross_attention{false};
     int head_num{0};
     int kv_head_num{0};
@@ -216,24 +239,48 @@ struct QKVPreprocessingParams
         ss << "kv_cache_block_scales_buffer: " << kv_cache_block_scales_buffer.data << std::endl;
         ss << "qkv_bias: " << qkv_bias << std::endl;
         ss << "tokens_info: " << tokens_info << std::endl;
-        ss << "seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "cache_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) cache_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "encoder_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) encoder_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "cu_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) cu_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "cu_kv_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "rotary_embedding_inv_freq: "
-           << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
-                  runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
+        if (seq_lens && batch_size > 0)
+        {
+            ss << "seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) seq_lens, tensorrt_llm::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (cache_seq_lens && batch_size > 0)
+        {
+            ss << "cache_seq_lens: "
+               << *(runtime::ITensor::wrap((void*) cache_seq_lens, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size})));
+        }
+        if (encoder_seq_lens && batch_size > 0)
+        {
+            ss << "encoder_seq_lens: "
+               << *(runtime::ITensor::wrap((void*) encoder_seq_lens, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size})));
+        }
+        if (cu_seq_lens && batch_size > 0)
+        {
+            ss << "cu_seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) cu_seq_lens, tensorrt_llm::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (cu_kv_seq_lens && batch_size > 0)
+        {
+            ss << "cu_kv_seq_lens: "
+               << *(runtime::ITensor::wrap((void*) cu_kv_seq_lens, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size})));
+        }
+        if (sparse_kv_offsets)
+        {
+            ss << "sparse_kv_offsets: "
+               << *(runtime::ITensor::wrap((void*) sparse_kv_offsets, tensorrt_llm::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size + 1})));
+        }
+        if (rotary_embedding_inv_freq && batch_size > 0 && rotary_embedding_dim > 0)
+        {
+            ss << "rotary_embedding_inv_freq: "
+               << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, tensorrt_llm::DataType::kFLOAT,
+                      runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
+        }
         ss << "rotary_coef_cache_buffer: " << rotary_coef_cache_buffer << std::endl;
         ss << "qkv_scale_orig_quant: " << qkv_scale_orig_quant << std::endl;
         ss << "spec_decoding_position_offsets: " << spec_decoding_position_offsets << std::endl;
@@ -244,6 +291,7 @@ struct QKVPreprocessingParams
         ss << "sink_token_len: " << sink_token_len << std::endl;
         ss << "token_num: " << token_num << std::endl;
         ss << "remove_padding: " << remove_padding << std::endl;
+        ss << "is_last_chunk: " << is_last_chunk << std::endl;
         ss << "cross_attention: " << cross_attention << std::endl;
         ss << "head_num: " << head_num << std::endl;
         ss << "kv_head_num: " << kv_head_num << std::endl;
@@ -362,23 +410,46 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
 template <typename T, typename T_cache, typename KVCacheBuffer>
 void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
 
+template <typename T, typename T_cache, typename KVCacheBuffer>
+void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
+
+// Debug function to test basic parameter access
+template <typename T, typename KVCacheBuffer>
+void invokeDebugSparseKvCacheParams(
+    QKVPreprocessingParams<T, KVCacheBuffer> params, int* debug_output, cudaStream_t stream);
+
+//! Compact a uniform group of KVCacheManagerV2 layer pools in one batched launch
+//! (per request and head, moves are ascending and never overtake their sources:
+//! the copy runs in place).
+template <typename T>
+void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
+    int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
+    int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
+    int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream);
+
 template <typename T, typename KVCacheBuffer>
 void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
     params.setCommonParameters();
-    if (params.cache_type == KvCacheDataType::INT8)
+
+    // handle sparse KV cache update if needed
+    if (params.sparse_kv_indices != nullptr && params.sparse_kv_offsets != nullptr && params.is_last_chunk)
     {
-        invokeUpdateCyclicKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
-    }
+        if (params.cache_type == KvCacheDataType::INT8)
+        {
+            invokeUpdateSparseKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
+        }
 #ifdef ENABLE_FP8
-    else if (params.cache_type == KvCacheDataType::FP8)
-    {
-        invokeUpdateCyclicKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
-    }
+        else if (params.cache_type == KvCacheDataType::FP8)
+        {
+            invokeUpdateSparseKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+        }
 #endif // ENABLE_FP8
-    else
-    {
-        invokeUpdateCyclicKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+        else
+        {
+            invokeUpdateSparseKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+        }
     }
 }
 
@@ -419,4 +490,4 @@ void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_len
 
 } // namespace kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

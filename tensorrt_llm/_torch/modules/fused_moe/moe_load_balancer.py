@@ -1,3 +1,4 @@
+import gc
 import os
 import threading
 from contextlib import nullcontext
@@ -14,6 +15,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...distributed import AllReduce
+from ...mmap_utils import advise_tensor_pageout
 from ...utils import EventType
 from ..multi_stream_utils import do_multi_stream
 
@@ -79,6 +81,8 @@ class HostMoeTensorSharer:
 
         self.shared_tensors = {}
         self.names = []
+
+        self.loaded_shared_weights = []
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
@@ -160,6 +164,16 @@ class HostMoeTensorSharer:
     def align_size(size: int):
         return (size + 256 - 1) // 256 * 256
 
+    def add_raw_host_weight_for_unmap(self,
+                                      raw_weight_tensors: List[torch.Tensor]):
+        """
+        Add a raw weight (mmapped Tensor) to HostMoeTensorSharer for later `madvise` to save host memory.
+
+        Args:
+            raw_weight_tensors: A list of raw weight tensors
+        """
+        self.loaded_shared_weights.extend(raw_weight_tensors)
+
     def finalize_layer_weights(self):
         self.names = list(sorted(self.name_info.keys()))
         assert len(
@@ -214,6 +228,13 @@ class HostMoeTensorSharer:
                 self.host_weights[key] = st
                 offset += aligned_size
         self.shared_tensors = {}
+
+        for raw_weight in self.loaded_shared_weights:
+            advise_tensor_pageout(raw_weight)
+
+        self.loaded_shared_weights = []
+
+        gc.collect()
 
     def finalize_host_tensor_sharing(self, add_host_weight_fn: Callable = None):
         """
@@ -352,6 +373,9 @@ class SingleLayerMoeLoadBalancer:
     def get_layer_idx(self):
         return self.single_layer_load_balancer_impl.get_layer_id()
 
+    def get_old_rank_expert_ids(self):
+        return self.single_layer_load_balancer_impl.get_old_rank_expert_ids()
+
     def get_load_expert_ids(self):
         assert self.updates_enabled, "should not call get_load_expert_ids when using statistic routing"
         return self.load_expert_ids
@@ -362,8 +386,11 @@ class SingleLayerMoeLoadBalancer:
     def is_static_routing(self):
         return not self.updates_enabled
 
-    def need_load_shared_weights(self):
+    def is_dynamic_routing(self):
         return self.updates_enabled
+
+    def need_load_shared_weights(self):
+        return self.is_dynamic_routing()
 
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
@@ -401,6 +428,17 @@ class SingleLayerMoeLoadBalancer:
         """
         moe_weight = _tensor_to_weight(t)
         self._add_weight_slot(local_slot_id, name, moe_weight)
+
+    def _add_raw_host_weight_for_unmap(self,
+                                       raw_weight_tensors: List[torch.Tensor]):
+        """
+        Add a raw weight (mmapped Tensor) to LoadBalancer for later `madvise` to save host memory.
+
+        Args:
+            raw_weight_tensors: A list of raw weight tensors
+        """
+        self.host_tensor_sharer.add_raw_host_weight_for_unmap(
+            raw_weight_tensors)
 
     def _add_host_weight(self, expert_id: int, name: str,
                          host_weight: _tbr.MoeWeight):
@@ -699,8 +737,9 @@ class SingleLayerMoeLoadBalancer:
         Returns:
             A tensor of routed slot IDs
         """
-        assert self.func_called_count["done_wait_gpu_stage"] == 1
-        self.func_called_count["route"] += 1
+        if self.is_dynamic_routing():
+            assert self.func_called_count["done_wait_gpu_stage"] == 1
+            self.func_called_count["route"] += 1
         return torch.ops.trtllm.moe_load_balance_routing(
             token_selected_experts, offset_by_ep_rank,
             self.single_layer_load_balancer_ptr)
@@ -772,6 +811,9 @@ class MoeLoadBalancer:
     def is_static_routing(self):
         # if we don't update, then it is statistic routing.
         return self.layer_updates_per_iter == 0
+
+    def is_dynamic_routing(self):
+        return not self.is_static_routing()
 
     def _setup_mpi_comm(self):
         global_mpi_comm = tensorrt_llm.mpi_comm()
@@ -871,6 +913,19 @@ class MoeLoadBalancer:
         if enable_update_weights is not None:
             self.enable_update_weights = enable_update_weights
 
+    def reconfigure_mask_only(self, dead_ranks: list[int]) -> None:
+        """
+        Reconfigure EPLB routing so slots on dead EP ranks are unreachable.
+
+        This validates that every expert still has at least one surviving
+        replica. The caller must separately gate degraded-mode capacity/HBM
+        headroom before invoking this method.
+        """
+        if self.in_iter:
+            raise RuntimeError(
+                "Cannot reconfigure EPLB mask while an iteration is active")
+        self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
+
     def start_iter(self):
         """
         Start a new iteration.
@@ -957,10 +1012,25 @@ class MoeLoadBalancer:
 
 moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
+    'DeepseekV32ForCausalLM',
+    'DeepseekV4ForCausalLM',
+    'GlmMoeDsaForCausalLM',
+    'GptOssForCausalLM',
+    'KimiK25ForConditionalGeneration',
     'MixtralForCausalLM',
     'Llama4ForConditionalGeneration',
+    'NemotronHForCausalLM',
     'Qwen2MoeForCausalLM',
     'Qwen3MoeForCausalLM',
+    'Qwen3_5MoeForCausalLM',
+    # Composite MoE VLMs are routed through their top-level
+    # ConditionalGeneration arch, so EPLB setup must recognize those here (the
+    # text-only arches above never match for the VLM wrapper). The inner MoE LM
+    # (Qwen3MoeForCausalLM / Qwen3_5MoeForCausalLM) inherits the setup() state
+    # via the wrapper's deepcopy of model_config. Same pattern as
+    # Llama4ForConditionalGeneration.
+    'Qwen3VLMoeForConditionalGeneration',
+    'Qwen3_5MoeForConditionalGeneration',
 ]
 
 

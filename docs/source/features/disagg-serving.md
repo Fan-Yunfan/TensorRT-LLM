@@ -1,18 +1,16 @@
-# Disaggregated Serving (Beta)
-
-```{note}
-Note:
-This feature is currently in beta, and the related APIs are subjected to change in future versions.
-```
+# Disaggregated Serving
 
 - [Motivation](#Motivation)
 - [KV Cache Exchange](#KV-Cache-Exchange)
   - [Multi-backend Support](#Multi-backend-Support)
+  - [NIXL Backend Configuration](#nixl-backend-configuration)
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
+  - [Unique Global Request ID](#Unique-Global-Request-ID)
 - [Usage](#Usage)
-  - [trtllm-serve](#trtllm-serve)
   - [Dynamo](#Dynamo)
+  - [trtllm-serve](#trtllm-serve)
+  - [Multiple Instances](#multiple-instances)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
 
@@ -43,7 +41,7 @@ In aggregated LLM serving, both the context and generation phases share the same
 
 Disaggregated serving resolves these challenges by decoupling the two phases, allowing each to run on separate GPU pools and using different parallelism strategies. This separation removes the interference between context and generation phases, as shown in Figure 2, and enables independent optimization of TTFT and TPOT. Although disaggregation incurs overhead for transferring the KV cache blocks from context to generation GPUs, the advantages can be substantial—particularly for workloads with long input sequences and moderate output lengths where interference is most severe.
 
-You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rational and design considerations of disaggregated serving.
+You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rationale and design considerations of disaggregated serving.
 
 ## KV Cache Exchange
 
@@ -57,6 +55,18 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
+
+### NIXL Backend Configuration
+
+NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+
+**Supported NIXL backends:**
+- **UCX** (default)
+- **LIBFABRIC** (available from v0.16.0)
+
+If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+
+For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
 
 ### Overlap Optimization
 
@@ -82,11 +92,50 @@ To minimize KV cache transmission latency, TensorRT LLM currently uses direct tr
 
 The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
 
+### Unique Global Request ID
+
+The context and generation phases of one request must share a single request ID: the ctx↔gen KV-cache transfer is keyed by it, so a collision (two in-flight requests with the same ID) corrupts the transfer. This shared ID is carried on `DisaggregatedParams.disagg_request_id`.
+
+The disaggregated server generates this ID itself as a **snowflake** — a self-contained 64-bit positive integer that is unique without any cross-process coordination. The bit layout is:
+
+```
+[ 0 (1 bit) | timestamp_ms (39 bits) | node_id (8 bits) | process_id (6 bits) | counter (10 bits) ]
+```
+
+- `node_id` (0–255) identifies the node (defaults to a hash of the MAC address; overridable via `node_id` in the disaggregated config).
+- `process_id` (0–63) identifies the orchestrator process on that node. In a [coordinator + worker fleet](#coordinator-and-worker-fleet) each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the `TRTLLM_DISAGG_WORKER_PROCESS_ID` environment variable (assigned automatically per worker by the launcher).
+- The `(node_id, process_id)` pair therefore makes the ID unique across all orchestrator processes without a shared counter or an extra network round trip — each worker mints its own IDs locally.
+
+Global disaggregated IDs occupy the range `[1 << 40, 2**63)`; worker-local and warm-up request IDs occupy the disjoint range `[0, 1 << 40)`, so the two never collide. If a client supplies its own positive `disagg_request_id`, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.
+
 ## Usage
+
+### Dynamo
+
+The first approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
+
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
+
+In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
+
+Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
+
+For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/backends/tensor-rt-llm).
 
 ### trtllm-serve
 
-The first approach to do disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
+The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
+
+```{eval-rst}
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+```
 
 <div align="center">
 <figure>
@@ -106,27 +155,31 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
+`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`, `UCX`, `NIXL`, and `MPI`. The default backend is NIXL.
+
+Note: NIXL supports multiple underlying backends configured via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable:
+- `UCX` (default)
+- `LIBFABRIC` (available from v0.16.0)
 
 `max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
-For example, you could launch two context servers and one generation servers as follows:
+For example, you could launch two context servers and one generation server as follows:
 
 ```
 
-# Generate context_extra-llm-api-config.yml
+# Generate context_config.yml
 # Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_config.yml
 
 # Start Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --config ./context_config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --config ./context_config.yml &> log_ctx_1 &
 
-# Generate gen_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
+# Generate gen_config.yml
+echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_config.yml
 
 # Start Generation servers
-CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
@@ -155,8 +208,12 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint. For example,  you can send requests to the disaggregated server using curl:
-```bash
+The config also accepts an optional field that tunes the HTTP listeners:
+
+- `server_keep_alive_timeout` (int, default `10`) — HTTP keep-alive timeout in seconds, applied to the client-facing listener and to the coordinator's listener when it runs in-process (see [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)). Raise it (for example, `3600`) when clients hold large idle connection pools and hit `Connection reset by peer` on a reused connection: the server closing an idle connection first leaves the client with a half-closed socket that fails on the next request.
+
+Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
+```
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -171,27 +228,120 @@ curl http://localhost:8000/v1/completions \
 
 Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
 
-### Dynamo
+### Multiple Instances
 
-The second approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
+To increase maximum concurrency without more GPU nodes, you can deploy multiple disaggregated server instances across different nodes, while each instance manages the same context/generation servers. This is helpful when one disaggregated server becomes a performance bottleneck or runs out of ephemeral ports.
 
-<div align="center">
-<figure>
-  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
-</figure>
-</div>
-<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
+Example (two-node deployment):
 
-In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
+- **Node A**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-a:8000`
+- **Node B**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-b:8000`
+- **Client entrypoint**
+  - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
 
-Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
+### Coordinator and Worker Fleet
 
-For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/latest/examples/trtllm.html).
+A single disaggregated server process is itself a single-threaded orchestrator and can become a throughput bottleneck (it terminates every client connection, runs routing, and proxies the ctx→gen hop). To scale the orchestrator on one node without standing up multiple independent instances, `trtllm-serve disaggregated` can run a **fleet** of stateless disaggregated-server worker processes behind a shared **coordinator**.
+
+The two roles split as follows:
+
+- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
+- **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
+
+This is controlled by two fields in the disaggregated config:
+
+- `num_workers` (int, default `1`) — number of disaggregated-server worker processes to run on the public port.
+- `disagg_coordinator_url` (str, optional) — URL of an already-running coordinator. When set, this process starts **no** coordinator and its fleet delegates to that external one.
+
+The three resulting topologies:
+
+| `num_workers` | `disagg_coordinator_url` | Behavior |
+|---------------|--------------------------|----------|
+| `1` | unset | Single self-contained server with an in-process coordinator (the default; unchanged from earlier examples). |
+| `> 1` | unset | An **implicit** coordinator starts in this process (on `port - 1`) and a fleet of `num_workers` delegating servers runs on the public port. |
+| any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
+
+```{note}
+The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+```
+
+#### Example: implicit coordinator + 4-worker fleet
+
+Extend the `disagg_config.yaml` from the [trtllm-serve](#trtllm-serve) example with `num_workers` and a router type:
+
+```yaml
+hostname: localhost
+port: 8000
+backend: pytorch
+# Run 4 stateless disaggregated-server workers on port 8000, with an implicit
+# coordinator started in-process on port 7999 (port - 1).
+num_workers: 4
+context_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+  router:
+    type: kv_cache_aware
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+  router:
+    type: kv_cache_aware
+```
+
+Launch it exactly as before — the coordinator and fleet are started for you:
+
+```bash
+trtllm-serve disaggregated -c disagg_config.yaml
+```
+
+Clients still send requests to the public endpoint (`localhost:8000`); the fleet transparently delegates routing to the coordinator.
+
+#### Example: external coordinator
+
+To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set `disagg_coordinator_url` and omit the coordinator from this process:
+
+```yaml
+hostname: localhost
+port: 8000
+backend: pytorch
+num_workers: 4
+disagg_coordinator_url: "http://coordinator-host:7999"
+context_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+  router:
+    type: kv_cache_aware
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+  router:
+    type: kv_cache_aware
+```
+
+```{note}
+A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
+```
 
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
+* `TRTLLM_NIXL_KVCACHE_BACKEND`: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:
+  - `UCX` (default)
+  - `LIBFABRIC` (available from v0.16.0)
+  - If an unsupported value is specified, NIXL will automatically fall back to UCX
 
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
 
@@ -209,9 +359,14 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
-* `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
+* `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
+  mixing support off by default to reduce launch overhead for CUDA graph-captured NCCL operations.
+  This assumes the communicator is not used by parallel graph launches or by uncaptured NCCL calls
+  while a graph launch is outstanding. Set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore NCCL's default
+  graph mixing behavior if your workload needs it. For more details, see the
+  [NCCL_GRAPH_MIXING_SUPPORT documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-graph-mixing-support).
 
-* ``UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
+* `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
 ## Troubleshooting and FAQ
 
@@ -219,7 +374,7 @@ There are some other useful environment variables that may help when encounterin
 
 *Q. What are the limitations of disaggregated serving in TRT-LLM?*
 
-A. Currently, only decoder-only models and beam width of 1  are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
+A. Currently, only decoder-only models and beam width of 1 are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
 
 *Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
 
@@ -239,6 +394,15 @@ A. Yes, it's recommended that different server instances use different GPUs. We 
 
 ### Debugging FAQs
 
+*Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
+
+A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+
+1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
+2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+
+Please see the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md) for detailed installation and configuration instructions.
+
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
 A. please set `backendType` of `CacheTransceiverConfig`.
@@ -250,6 +414,12 @@ executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendTy
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
+
+*Q. How do I debug a suspected hang from overlapping NCCL graph operations?*
+
+A. TensorRT-LLM turns graph mixing support off by default for common NCCL communicators. To check if
+a hang might be related to NCCL graph mixing support, set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore
+NCCL's default graph mixing behavior.
 
 *Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
 

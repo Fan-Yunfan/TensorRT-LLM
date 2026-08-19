@@ -9,25 +9,44 @@ import jsonschema
 import openai
 import pytest
 import yaml
+from utils.llm_data import llm_datasets_root
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
+os.environ['TIKTOKEN_RS_CACHE_DIR'] = os.path.join(llm_datasets_root(),
+                                                   'tiktoken_vocab')
+os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
+                                                     'tiktoken_vocab')
+
+
+@pytest.fixture(scope="module",
+                params=[
+                    "meta-llama/Llama-3.1-8B-Instruct",
+                    "openai/gpt-oss-120b",
+                    pytest.param("zai-org/GLM-5-FP8",
+                                 marks=pytest.mark.skip_less_device(8)),
+                ])
+def model_name(request):
+    return request.param
 
 
 @pytest.fixture(scope="module")
-def model_name():
-    return "llama-3.1-model/Llama-3.1-8B-Instruct"
-
-
-@pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file():
+def temp_extra_llm_api_options_file(model_name: str):
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
         extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
-
+        if model_name == "openai/gpt-oss-120b":
+            extra_llm_api_options_dict["speculative_config"] = {
+                "decoding_type":
+                "Eagle",
+                "max_draft_len":
+                3,
+                "speculative_model_dir":
+                get_model_path("gpt_oss/gpt-oss-120b-Eagle3"),
+            }
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
 
@@ -39,13 +58,21 @@ def temp_extra_llm_api_options_file():
 
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
-    model_path = get_model_path(model_name)
+    if model_name == "meta-llama/Llama-3.1-8B-Instruct":
+        model_path = get_model_path("llama-3.1-model/Llama-3.1-8B-Instruct")
+    elif model_name == "openai/gpt-oss-120b":
+        model_path = get_model_path("gpt_oss/gpt-oss-120b")
+    elif model_name == "zai-org/GLM-5-FP8":
+        model_path = get_model_path("GLM-5-FP8")
 
-    # Use small max_batch_size/max_seq_len/max_num_tokens to avoid OOM on A10/A30 GPUs.
     args = [
-        "--max_batch_size=8", "--max_seq_len=1024", "--max_num_tokens=1024",
+        "--max_batch_size=8", "--max_seq_len=4096", "--max_num_tokens=4096",
         f"--extra_llm_api_options={temp_extra_llm_api_options_file}"
     ]
+
+    if model_name == "zai-org/GLM-5-FP8":
+        args.extend(["--tp_size=8", "--ep_size=8"])
+
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -94,6 +121,49 @@ def test_json_schema(client: openai.OpenAI, model_name: str):
             "type": "json",
             "schema": json_schema
         },
+    )
+
+    message = chat_completion.choices[0].message
+    assert message.content is not None
+    assert message.role == "assistant"
+    jsonschema.validate(json.loads(message.content), json_schema)
+
+
+def test_openai_compatible_json_schema(client: openai.OpenAI, model_name: str):
+    json_schema = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "pattern": "^[\\w]+$"
+            },
+            "population": {
+                "type": "integer"
+            },
+        },
+        "required": ["name", "population"],
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant.",
+        },
+        {
+            "role":
+            "user",
+            "content":
+            "Give me the information of the capital of France in the JSON format.",
+        },
+    ]
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=256,
+        response_format={
+            "type": "json_schema",
+            "json_schema": json_schema
+        },
+        temperature=0.0,
     )
 
     message = chat_completion.choices[0].message
@@ -221,7 +291,7 @@ country ::= "England" | "France" | "Germany" | "Italy"
         },
         {
             "role": "user",
-            "content": "Give me the information of the capital of France.",
+            "content": "What's the capital of France?",
         },
     ]
     chat_completion = client.chat.completions.create(
@@ -333,6 +403,7 @@ You are a helpful assistant."""
         model=model_name,
         messages=messages,
         max_completion_tokens=256,
+        temperature=0.0,
         response_format={
             "type": "structural_tag",
             "format": {

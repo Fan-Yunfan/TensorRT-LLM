@@ -29,12 +29,116 @@ TensorRT LLM classifies APIs into two categories:
 - Schema stored in: `tests/unittest/api_stability/references/`
 - See [API status documentation](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html) for complete details
 
+### LLM API Change Classification
+
+Any backwards-incompatible LLM API change is breaking, regardless of whether the
+affected API is committed, prototype, beta, deprecated, or otherwise
+non-committed. Examples include removing arguments or methods, making optional
+arguments required, changing defaults in a way existing callers observe,
+narrowing accepted values, or changing return shapes/types.
+
+Do not break committed APIs. Prefer deprecation and migration paths. Breaking a
+non-committed API is less strict, but should still be avoided unless justified.
+If a pull request updates API stability reference files, classify the accepted
+contract change with exactly one GitHub label enforced by the LLM API
+Compatibility workflow: `api-compatible` or `api-breaking`. For `api-breaking`,
+include `BREAKING` in the PR title.
+
 ## API Schema Management
 
 All API schemas are:
 - Stored as YAML files in the codebase
 - Protected by unit tests in `tests/unittest/api_stability/`
-- Automatically validated to ensure consistency 
+- Automatically validated to ensure consistency
+
+## API Change Principles
+
+### 1. Knob Naming
+
+**Use Semantic Clarity**
+
+Argument names should describe what the argument represents, not how it is used internally.
+
+✅ **Good**: `max_new_tokens` (clear meaning)
+
+❌ **Bad**: `num` (ambiguous)
+
+**Reflect Argument Type and Granularity**
+
+- For **boolean** knobs, prefix with verbs like `enable_` and so on.
+
+  Examples: `enable_cache`, `enable_flash_attention`
+
+- For **numerical threshold** knobs, suffix with `_limit`, `_size`, `_count`, `_len_` or `_ratio`
+
+  Examples: `max_seq_len`, `prefill_batch_size`
+
+**Avoid Redundant Prefixes**
+
+Example (in `MoeConfig`):
+
+✅ **Good**: `backend`
+
+❌ **Bad**: `moe_backend` (redundant since it's already in `MoeConfig`)
+
+**Use Specific Names for Narrow Scenarios**
+
+When adding knobs for specific use cases, make the name convey the restriction clearly via a prefix. It's acceptable to rename later when the knob becomes more generic or is moved into a dedicated config.
+
+Example (argument to the LLM class):
+
+✅ **Good**: `rope_scaling_factor` → clearly indicates it's for RoPE
+
+❌ **Bad**: `scaling_factor` → too generic and prone to misuse
+
+### 2. Hierarchical Configuration
+
+Organize complex or hierarchical arguments into **dedicated configuration dataclasses** with intuitive and consistent naming.
+
+**Guidelines**
+
+- Use the `XxxConfig` suffix consistently
+
+  Examples: `ModelConfig`, `ParallelConfig`, `MoeConfig`
+
+- **Reflect conceptual hierarchy**
+
+  The dataclass name should represent a coherent functional unit, not an arbitrary grouping
+
+- **Avoid over-nesting**
+
+  Use only one level of configuration hierarchy whenever possible (e.g., `LlmArgs → ParallelConfig`) to balance readability and modularity
+
+### 3. Prefer `LlmArgs` Over Environment Variables
+
+`LlmArgs` is the central place for all configuration knobs. It integrates with our infrastructure to ensure:
+
+- **API Stability**
+  - Protects committed (stable) APIs
+  - GitHub reviewer committee oversees API stability
+
+- **API Status Registration**
+  - Uncommitted (unstable) APIs must be marked as `"prototype"` or `"beta"`
+  - API statuses are displayed in the documentation
+
+- **API Documentation**
+  - Each knob uses a `Field` with a description
+  - Automatically rendered in public documentation
+
+> Managing knobs in `LlmArgs` remains **scalable and maintainable** thanks to our existing infrastructure and review processes.
+
+**Drawbacks of Environment Variables:**
+
+- Dispersed across the codebase
+- Lack documentation and discoverability
+- Pose challenges for testing and validation
+
+**Guidelines for Adding Knobs:**
+
+- ✅ Add clear, descriptive documentation for each field
+- ✅ It's fine to add temporary knobs and refine them later
+- ⚠️ Always mark temporary knobs as `"prototype"` if not stable yet
+- ✅ Refactor prototype knobs as they mature, promote them to "beta" or "stable".
 
 ## Modifying LLM Constructor Arguments
 
@@ -73,7 +177,7 @@ garbage_collection_gen0_threshold: int = Field(
 
 Add the field to the appropriate schema file:
 
-- **Non-committed arguments**: `tests/unittest/api_stability/references/llm_args.yaml`
+- **Non-committed arguments**: `tests/unittest/api_stability/references/llm.yaml`
   ```yaml
   garbage_collection_gen0_threshold:
     type: int
@@ -81,13 +185,15 @@ Add the field to the appropriate schema file:
     status: beta  # Must match the status in code
   ```
 
-- **Committed arguments**: `tests/unittest/api_stability/references_committed/llm_args.yaml`
+- **Committed arguments**: `tests/unittest/api_stability/references_committed/llm.yaml`
   ```yaml
   garbage_collection_gen0_threshold:
     type: int
     default: 20000
     # No status field for committed arguments
   ```
+
+Before validation, run `python3 scripts/generate_llm_args_golden_manifest.py` and commit the manifest; new fields require telemetry/privacy CODEOWNER approval.
 
 #### 3. Run validation tests
 
@@ -115,16 +221,16 @@ For non-committed APIs, use the `@set_api_status` decorator:
 ```python
 @set_api_status("beta")
 def generate_with_streaming(
-    self, 
-    prompts: List[str], 
+    self,
+    prompts: List[str],
     **kwargs
 ) -> Iterator[GenerationOutput]:
     """Generate text with streaming output.
-    
+
     Args:
         prompts: Input prompts for generation
         **kwargs: Additional generation parameters
-        
+
     Returns:
         Iterator of generation outputs
     """
@@ -175,12 +281,15 @@ When modifying existing methods:
 1. **Non-breaking changes** (adding optional parameters):
    - Update the method signature
    - Update the schema file
+   - Apply the `api-compatible` label if API stability reference files change
    - No status change needed
 
 2. **Breaking changes** (changing required parameters, return types):
-   - Only allowed for non-committed APIs
-   - Consider deprecation path for beta APIs
-   - Update documentation with migration guide
+   - Treat as breaking regardless of committed, prototype, beta, or deprecated status
+   - Do not break committed APIs; prefer deprecation and migration paths
+   - Avoid breaking non-committed APIs too, unless justified
+   - Apply the `api-breaking` label
+   - Include `BREAKING` in the PR title
 
 ### Best Practices
 

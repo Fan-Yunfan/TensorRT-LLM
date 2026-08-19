@@ -1,43 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import os
-import sys
+from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
+import triton_kernels.swiglu
+from triton_kernels.matmul import (FlexCtx, FnSpecs, FusedActivation,
+                                   PrecisionConfig, matmul)
+from triton_kernels.numerics import InFlexData
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+from triton_kernels.reduce import reduce as triton_reduce
+from triton_kernels.tensor import FP4, DataType, RaggedTensorMetadata
+from triton_kernels.tensor import Storage as TritonStorage
+from triton_kernels.tensor import Tensor as TritonTensor
+from triton_kernels.tensor import convert_layout, wrap_torch_tensor
+from triton_kernels.tensor_details import layout
 
-from tensorrt_llm.math_utils import ceil_div
-
-IS_TRITON_KERNELS_AVAILABLE = False
-# We expect to find triton_kernels under $TRITON_ROOT/python/triton_kernels
-# Triton upstream commit f3067cd3bd0c29065fa4ecdb724b6f29cbabea5f has been verified.
-triton_root = os.getenv('TRITON_ROOT')
-if triton_root:
-    triton_root = os.path.abspath(
-        os.path.join(triton_root, 'python', 'triton_kernels'))
-    if os.path.exists(triton_root) and triton_root not in sys.path:
-        sys.path.insert(0, triton_root)
-    assert triton.__version__ >= "3.4.0", "Triton kernels are detected but the Triton wheel is too old"
-    import triton_kernels.swiglu
-    from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
-                                           PrecisionConfig, matmul_ogs)
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
-    IS_TRITON_KERNELS_AVAILABLE = True
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
-from .interface import MoE
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
+                            MoERejectReason)
+from .interface import MoE, _reject
 from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
                            load_activation_scales_fp8_qdq,
                            requantize_expert_w3_w1_weight_fp8_qdq)
-from .routing import BaseMoeRoutingMethod, RenormalizeMoeRoutingMethod
+from .routing import (ROUTING_METHOD_TYPE_TO_CLASS, BaseMoeRoutingMethod,
+                      RenormalizeMoeRoutingMethod)
 
 
 # Triton kernels has hardcoded beta = 1, so we use this implementation when beta is not 1
@@ -104,7 +113,7 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         shifted = tl.where(start_bit == 0, v1,
                            (v1 >> start_bit) | (v2 << (32 - start_bit)))
 
-        # write back in place; bits past the region are already zero
+        # write back in place; _routing_clear_bitmatrix zeroes stale bits after
         tl.store(Bitmatrix + pid_m * stride_bm + w * stride_bn,
                  shifted.to(tl.int32),
                  mask=dst_mask)
@@ -124,38 +133,113 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         tl.store(ptr, yi, mask=mask_i)
 
 
+# After shifting the bitmatrix so that the local expert slice starts at bit 0,
+# clear all bits at positions >= cutoff (n_expts_local).  Without this, stale
+# bits from out-of-slice experts remain set and corrupt the subsequent
+# compaction and routing.
+# This kernel was removed from triton_kernels in 3.6.0, so we keep a local
+# copy here.
+@triton.jit
+def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn, cutoff,
+                             BLOCK_N: tl.constexpr):
+    pid_m = tl.program_id(0)
+    cutoff_word = cutoff // 32
+    cutoff_bit = cutoff % 32
+    cutoff_mask = (1 << (cutoff_bit)) - 1
+    for start_n in range(0, shape_bn, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        values = tl.load(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                         mask=offs_n < shape_bn)
+        values = tl.where(offs_n == cutoff_word, values & cutoff_mask, values)
+        values = tl.where(offs_n > cutoff_word, 0, values)
+        tl.store(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                 values,
+                 mask=offs_n < shape_bn)
+
+
+@dataclass
+class TritonRoutingData:
+    """Routing information consumed by the Triton MoE matmul calls.
+
+    Replaces the removed ``matmul_ogs`` routing wrappers. ``matmul`` now takes
+    ragged-tensor metadata and plain gather/scatter tensors directly.
+    """
+    # Per-expert ragged metadata, passed as `a_ragged_metadata` to matmul.
+    ragged_metadata: RaggedTensorMetadata
+    # Routing weights in expert-sorted (compute) order, passed as `gammas`.
+    gate_scal: torch.Tensor
+    # Number of experts per token (top-k).
+    n_expts_act: int
+    # True for expanded (token-major) rows that received an expert output;
+    # False for slots pruned by expert-parallel routing or padding. Used to
+    # mask the top-k combine.
+    scatter_valid_mask: torch.Tensor
+
+
+def combine_expert_outputs(gemm2_output: torch.Tensor,
+                           rdata: Optional[TritonRoutingData]) -> torch.Tensor:
+    """Sum the per-expert rows of the scattered gemm2 output over top-k.
+
+    With ``scatter_indx``, ``matmul`` only permutes rows into token-major
+    expanded order. Rows for ``-1`` destinations remain uninitialized, so the
+    top-k reduction must mask them explicitly.
+
+    Args:
+        gemm2_output: ``[n_tokens * n_expts_act, hidden]`` gemm2 output in
+            expanded (token-major) row order, produced by a ``matmul`` call
+            with ``scatter_indx``.
+        rdata: routing data of that ``matmul`` call, or ``None`` for the
+            single-expert path (no routing), which is returned unchanged.
+
+    Returns:
+        ``[n_tokens, hidden]`` combined expert outputs.
+    """
+    if rdata is None:
+        return gemm2_output
+    n_expts_act = rdata.n_expts_act
+    assert gemm2_output.shape[-2] % n_expts_act == 0, (
+        f"expected [n_tokens * n_expts_act, hidden] rows, got "
+        f"{gemm2_output.shape[-2]} rows for n_expts_act={n_expts_act}")
+    n_tokens = gemm2_output.shape[-2] // n_expts_act
+    gemm2_output = gemm2_output.view(n_tokens, n_expts_act,
+                                     gemm2_output.shape[-1])
+    mask = rdata.scatter_valid_mask.view(n_tokens, n_expts_act,
+                                         1).expand_as(gemm2_output)
+    combined, _ = triton_reduce(gemm2_output, dim=1, mask=mask)
+    return combined
+
+
 class TritonEPRouter():
 
     def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
                          slice_start, slice_end):
         from triton_kernels.compaction import compaction
-        from triton_kernels.routing import _routing_clear_bitmatrix
         n_tokens_pad = expt_scal.shape[0]
+        bitmask_data = bitmatrix.mask.storage.data
         _routing_shift_bitmatrix_range[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
             expt_indx,
             expt_indx.stride(0),
             expt_indx.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmask_data.shape[1],
             expt_indx.shape[1],
             slice_start,
             slice_end,
             BLOCK_N=512,
         )
         _routing_clear_bitmatrix[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
+            bitmask_data.shape[1],
             slice_end - slice_start,
             BLOCK_N=512,
         )
-        # perform compaction to update expt_scal / expt_indx
-        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
+        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix.mask)
         n_expts_tot = slice_end - slice_start
-        bitmatrix.shape[-1] = n_expts_tot
+        bitmatrix.mask.shape[-1] = n_expts_tot
         return expt_scal, expt_indx, bitmatrix
 
     def __call__(self,
@@ -166,30 +250,66 @@ class TritonEPRouter():
                  ep=1,
                  node_idx=0,
                  n_rows=None):
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+        from triton_kernels.topk import topk
+
         n_expts_tot = logits.shape[-1]
         n_expts_local = n_expts_tot // ep
         slice_start = node_idx * n_expts_local
         slice_end = slice_start + n_expts_local
 
-        from triton_kernels.routing import routing_from_bitmatrix
-        from triton_kernels.topk import topk
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
-        expt_scal, expt_indx, bitmatrix = topk(logits,
-                                               n_expts_act,
-                                               apply_softmax=not sm_first,
-                                               y_indx=expt_indx,
-                                               n_rows=n_rows)
-        # mutate bitmatrix
+
+        bitmatrix = topk(logits,
+                         n_expts_act,
+                         apply_softmax=not sm_first,
+                         y_indx=expt_indx,
+                         n_rows=n_rows)
+        expt_scal = bitmatrix.vals
+        expt_indx = bitmatrix.indx
+
         if ep > 1:
             expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
                 expt_scal, expt_indx, bitmatrix, n_expts_tot, slice_start,
                 slice_end)
-        return routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx,
-                                      n_expts_local, n_expts_act)
+            # mask_metadata was computed eagerly in SparseMatrix.__post_init__
+            # before pruning mutated the bitmatrix.  Recompute it now.
+            from triton_kernels.tensor_details.bitmatrix import \
+                make_bitmatrix_metadata
+            metadata = make_bitmatrix_metadata(expt_indx, bitmatrix.mask)
+        else:
+            metadata = bitmatrix.mask_metadata
+
+        expt_data = make_ragged_tensor_metadata(metadata.col_sum,
+                                                logits.shape[0] * n_expts_act)
+        gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
+
+        rdata = TritonRoutingData(
+            ragged_metadata=expt_data,
+            gate_scal=gate_scal_sorted,
+            n_expts_act=n_expts_act,
+            scatter_valid_mask=metadata.row_sorted_indx != -1,
+        )
+        # For compute (expert-sorted) row i, `col_sorted_indx[i]` is the
+        # expanded (token-major) row `token * n_expts_act + k`. The gather
+        # index must address rows of the activations, hence the division; the
+        # scatter index addresses rows of the expanded output. This matches
+        # what `matmul_ogs` derived from its gather/scatter wrappers.
+        # Under EP pruning `col_sorted_indx` is -1 for pruned compute rows,
+        # which truncates to gather index 0 -- those rows read token 0's
+        # activation and compute garbage. That is safe only because their
+        # scatter destination is also -1, which the matmul kernel drops (same
+        # behavior as the old in-kernel division); the garbage is never
+        # written out.
+        gather_indx = torch.div(metadata.col_sorted_indx,
+                                n_expts_act,
+                                rounding_mode='trunc')
+        scatter_indx = metadata.col_sorted_indx
+        return rdata, gather_indx, scatter_indx
 
 
-def maybe_update_stride(weight):
+def update_weight_stride(weight):
     assert weight.dim() == 3
     # For the latest Triton kernels, w.stride(-2)==1 works universally
     return weight.transpose(1, 2).contiguous().transpose(1, 2)
@@ -217,11 +337,16 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             module.intermediate_size_per_partition,
             module.hidden_size,
         )
+        # Bias shapes use the output dimension (last dim) of the transposed weight shapes
+        w3_w1_bias_shape = (w3_w1_weight_shape[0], w3_w1_weight_shape[2])
+        w2_bias_shape = (w2_weight_shape[0], w2_weight_shape[2])
         super().create_weights(module,
                                weight_dtype,
                                w3_w1_weight_shape,
                                w2_weight_shape,
-                               bias_dtype=torch.float32)
+                               bias_dtype=torch.float32,
+                               w3_w1_bias_shape=w3_w1_bias_shape,
+                               w2_bias_shape=w2_bias_shape)
         self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -303,11 +428,15 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         hidden_states = x
         expert_logits = router_logits
@@ -342,22 +471,25 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1,
-                                 fused_activation=act)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
+            act_out = matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+                gather_indx=gather_indx,
+                precision_config=pc1,
+                fused_activation=act)
         else:
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1)
+            act_out = matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+                gather_indx=gather_indx,
+                precision_config=pc1)
             act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         # Step 3: Gemm2
@@ -366,14 +498,17 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
-        # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(act_out,
-                                  gemm2_weights,
-                                  module.w2_bias if module.bias else None,
-                                  rdata,
-                                  scatter_indx=scatter_indx,
-                                  precision_config=pc2,
-                                  gammas=rdata.gate_scal if rdata else None)
+        # Call the Triton kernel, which also does the scatter into
+        # token-major order; the top-k combine is done explicitly below.
+        gemm2_output = matmul(
+            act_out,
+            gemm2_weights,
+            module.w2_bias if module.bias else None,
+            a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+            scatter_indx=scatter_indx,
+            precision_config=pc2,
+            gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = combine_expert_outputs(gemm2_output, rdata)
         return gemm2_output
 
 
@@ -407,12 +542,17 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             module.intermediate_size_per_partition,
             module.hidden_size,
         )
+        # Bias shapes use the output dimension (last dim) of the transposed weight shapes
+        w3_w1_bias_shape = (w3_w1_weight_shape[0], w3_w1_weight_shape[2])
+        w2_bias_shape = (w2_weight_shape[0], w2_weight_shape[2])
         FusedMoEMethodBase.create_weights(self,
                                           module,
                                           weight_dtype,
                                           w3_w1_weight_shape,
                                           w2_weight_shape,
-                                          bias_dtype=torch.float32)
+                                          bias_dtype=torch.float32,
+                                          w3_w1_bias_shape=w3_w1_bias_shape,
+                                          w2_bias_shape=w2_bias_shape)
 
         fc31_dequant = nn.Parameter(torch.empty(
             module.expert_size_per_partition, dtype=torch.float32),
@@ -522,11 +662,15 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
+        module.w3_w1_weight.data = update_weight_stride(
+            module.w3_w1_weight.data)
+        module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         hidden_states, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             x, module.fc31_input_dequant)
@@ -572,22 +716,25 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1,
-                                 fused_activation=act)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
+            act_out = matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+                gather_indx=gather_indx,
+                precision_config=pc1,
+                fused_activation=act)
         else:
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1)
+            act_out = matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+                gather_indx=gather_indx,
+                precision_config=pc1)
             act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
@@ -604,14 +751,17 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
-        # Call the Triton kernel, which also does finalization
-        gemm2_output = matmul_ogs(act_out,
-                                  gemm2_weights,
-                                  module.w2_bias if module.bias else None,
-                                  rdata,
-                                  scatter_indx=scatter_indx,
-                                  precision_config=pc2,
-                                  gammas=rdata.gate_scal if rdata else None)
+        # Call the Triton kernel, which also does the scatter into
+        # token-major order; the top-k combine is done explicitly below.
+        gemm2_output = matmul(
+            act_out,
+            gemm2_weights,
+            module.w2_bias if module.bias else None,
+            a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+            scatter_indx=scatter_indx,
+            precision_config=pc2,
+            gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = combine_expert_outputs(gemm2_output, rdata)
         return gemm2_output
 
 
@@ -622,6 +772,73 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
     fc2_input_dequant: torch.Tensor
 
 
+def is_swizzling_supported() -> bool:
+    """Return whether the MXFP4 swizzled value/scale layouts work on the current CUDA device.
+
+    The swizzled layouts produced by ``make_default_matmul_mxfp4_w_layout`` /
+    ``make_default_matmul_mxfp4_w_scale_layout`` are broken on the H20 family
+    (e.g. ``NVIDIA H20``, ``NVIDIA H20-3e``), so callers must keep the natural
+    strided layout there. H200 uses substring exclusion because its device name
+    also contains ``H20``. This is a WAR. For proper fix, see nvbugs/6026676.
+    """
+    name = torch.cuda.get_device_name()
+    is_h20_family = "H20" in name and "H200" not in name
+    return not is_h20_family
+
+
+# Swizzling a full MoE weight tensor in one shot materializes several int32
+# temporaries of the full tensor size inside HopperMXValueLayout.swizzle_data
+# (~8x the packed weight bytes; the padded/permuted copies come on top). For
+# gpt-oss-120b that is a >8 GiB transient per MoE layer on top of the nearly
+# fully resident model, which OOMs 80GB GPUs during weight loading
+# (nvbugs/6384375). The expert dim is a pure batch dim for these layouts, so
+# swizzling expert chunks of at most this many source bytes is bit-identical
+# while capping the transient.
+MXFP4_SWIZZLE_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def convert_layout_expert_chunked(
+        t: torch.Tensor,
+        dtype: Optional[DataType],
+        new_layout: layout.Layout,
+        max_chunk_bytes: int = MXFP4_SWIZZLE_CHUNK_BYTES) -> TritonTensor:
+    """Memory-frugal equivalent of
+    ``convert_layout(wrap_torch_tensor(t, dtype=dtype), new_layout)``
+    for 3D ``(num_experts, K, N)`` tensors and layouts that treat the leading
+    dim as a batch dim (Hopper MXFP4 value/scale layouts).
+
+    ``new_layout`` carries the conversion parameters.
+    """
+    assert t.dim() == 3
+    # wrap_torch_tensor infers the dtype from the tensor when dtype is None.
+    wrapped = wrap_torch_tensor(t, dtype=dtype)
+    num_experts = t.shape[0]
+    bytes_per_expert = t[:1].numel() * t.element_size()
+    chunk = min(num_experts,
+                max(1,
+                    int(max_chunk_bytes) // max(bytes_per_expert, 1)))
+    new_data = None
+    for i in range(0, num_experts, chunk):
+        chunk_src = t[i:i + chunk]
+        chunk_wrapped = wrap_torch_tensor(chunk_src, dtype=dtype)
+        piece = convert_layout(chunk_wrapped, new_layout).storage.data
+        # Expert blocks must be dense and independent in storage for the
+        # chunked reassembly to be equivalent to the one-shot swizzle.
+        assert piece.stride(0) == piece[0].numel()
+        if new_data is None:
+            new_data = torch.empty_strided(
+                (num_experts, ) + tuple(piece.shape[1:]),
+                (piece.stride(0), ) + tuple(piece.stride()[1:]),
+                dtype=piece.dtype,
+                device=piece.device)
+        new_data[i:i + piece.shape[0]].copy_(piece)
+        del piece
+    return TritonTensor(TritonStorage(new_data, new_layout),
+                        dtype=wrapped.dtype,
+                        shape=wrapped.shape,
+                        shape_max=wrapped.shape_max)
+
+
 def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     # (num_experts, in_dim//2, out_dim)
     w_shape = w.shape
@@ -630,33 +847,111 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     assert w_shape[0] == w_scale_shape[0]
     assert w_shape[1] * 2 == w_scale_shape[1] * 32
     assert w_shape[2] == w_scale_shape[2]
-    w = maybe_update_stride(w)
+
+    # OOM fix: free the original storage after update_weight_stride, but only
+    # if .contiguous() actually created a new copy. When the input is already
+    # contiguous in the transposed layout, .contiguous() is a no-op and shares
+    # the same storage — resizing it would destroy the tensor we need.
+    original_w_storage = w.data.untyped_storage()
+    w = update_weight_stride(w)
+    if w.data.untyped_storage().data_ptr() != original_w_storage.data_ptr():
+        original_w_storage.resize_(0)
+        torch.cuda.empty_cache()
+    del original_w_storage
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
         f"TRITON_MOE_MXFP4_NUM_WARPS should be 4 or 8, got {num_warps}"
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1)
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps)
-    # swizzling path is broken for H20
-    if torch.cuda.get_device_name() == "NVIDIA H20":
-        from triton_kernels.tensor_details.layout_details.strided import \
-            StridedLayout
-        value_layout = StridedLayout
-        value_layout_opts = dict()
-        scale_layout = StridedLayout
-        scale_layout_opts = dict()
-
-    opt = {"value_layout": value_layout, "value_layout_opts": value_layout_opts, \
-            "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
+    # The mx axis is -2: the K dim in the factory's trailing-dims convention.
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=-2, num_warps=num_warps)
+    if not is_swizzling_supported():
+        # Keep the natural strided layout; conversion would repack the data.
+        value_layout = None
+        scale_layout = None
+    # Same reasoning when the factories themselves fall back to StridedLayout
+    # (pre-Hopper GPUs): skip the now-repacking conversion.
+    if isinstance(value_layout, layout.StridedLayout):
+        value_layout = None
+    if isinstance(scale_layout, layout.StridedLayout):
+        scale_layout = None
 
     # w, w_scale = downcast_to_mxfp(tensor.to(torch.bfloat16), torch.uint8, axis=1)
-    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
-                       **opt["value_layout_opts"])
-    w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"],
-                             **opt["scale_layout_opts"])
+    # The Hopper layouts are the ones whose one-shot swizzle needs several
+    # times the tensor size in temporaries; other layouts (Blackwell pad-only)
+    # are kept on the one-shot path, whose transients are bounded by the
+    # padded tensor size.
+    if isinstance(value_layout, layout.HopperMXValueLayout):
+        w = convert_layout_expert_chunked(w, FP4, value_layout)
+    elif value_layout is not None:
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout)
+    else:
+        w = wrap_torch_tensor(w, dtype=FP4)
+    if isinstance(scale_layout, layout.HopperMXScaleLayout):
+        w_scale = convert_layout_expert_chunked(w_scale, None, scale_layout)
+    elif scale_layout is not None:
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout)
+    else:
+        w_scale = wrap_torch_tensor(w_scale)
     return w, w_scale
+
+
+def get_padded_size(size: int, padding: int) -> int:
+    return ((size + padding - 1) // padding) * padding
+
+
+# Pad both n and k dimensions, then shard along shard_axis
+# Handles weights, scales, and biases, which are expected to be 1D or 2D tensors.
+def shard_and_pad_tensor(
+    tensor: torch.Tensor,
+    shard_axis: int,
+    n_alignment: int,
+    k_alignment: int,
+    tp_size: int,
+    tp_rank: int,
+    device: torch.device,
+) -> torch.Tensor:
+    assert tensor.dim() in (1,
+                            2), "Expecting single expect gemm weights or biases"
+    assert shard_axis in (0, 1), "Shard axis must be 0 or 1"
+
+    padding = [n_alignment, k_alignment]
+    size_to_pad = [0] * 2
+
+    tensor = tensor.to(device)
+
+    # First we pad the sharded axis
+    if shard_axis < tensor.dim():
+        padded_size = get_padded_size(tensor.shape[shard_axis],
+                                      padding[shard_axis] * tp_size)
+        assert 0 <= tp_rank < tp_size
+        assert tensor.shape[shard_axis] <= padded_size
+        assert padded_size % tp_size == 0
+
+        shard_size = padded_size // tp_size
+        shard_start = tp_rank * shard_size
+        assert shard_start < tensor.shape[shard_axis]
+        shard_end = min(shard_start + shard_size, tensor.shape[shard_axis])
+        actual_size = shard_end - shard_start
+
+        tensor = tensor.narrow(shard_axis, shard_start, actual_size)
+        size_to_pad[shard_axis] = shard_size - actual_size
+
+    # Now we pad the non-sharded axis
+    non_shard_axis = 1 - shard_axis
+    if non_shard_axis < tensor.dim():
+        padded_size = get_padded_size(tensor.shape[non_shard_axis],
+                                      padding[non_shard_axis])
+        size_to_pad[non_shard_axis] = padded_size - tensor.shape[non_shard_axis]
+
+    # Actually call pad
+    if any(size_to_pad):
+        pad = (0, size_to_pad[0]) if tensor.dim() == 1 else (0, size_to_pad[1],
+                                                             0, size_to_pad[0])
+        tensor = torch.nn.functional.pad(tensor, pad)
+
+    return tensor
 
 
 # We inherit from TritonUnquantizedFusedMoEMethod to reuse the weight preprocessing logic
@@ -667,8 +962,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         assert activation_dtype in [torch.float8_e4m3fn, torch.bfloat16], \
             f"TritonMXFP4FusedMoEMethod only supports float8_e4m3fn or bfloat16 activation, got {activation_dtype}"
         self.activation_dtype = activation_dtype
-        self.in_dim_padding_multiple = 128
-        self.out_dim_padding_multiple = 256
+
+        self.k_alignment = 128
+        self.n_alignment = 2 * self.k_alignment
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.uint8
@@ -676,39 +972,46 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # The Triton kernel accepts the w3_w1_weight in (num_experts, hidden_dim, intermediate_dim * 2) format
         w3_w1_weight_shape = (
             module.expert_size_per_partition,
-            module.hidden_size // 2,  # Two mxfp4 packed to a byte
-            module.intermediate_size_per_partition * 2,
+            get_padded_size(module.hidden_size, self.k_alignment) //
+            2,  # Two mxfp4 packed to a byte
+            get_padded_size(module.intermediate_size_per_partition * 2,
+                            self.n_alignment),
         )
 
-        # Full scale is loaded at the beginning, later we will slice properly for TP
         w3_w1_scale_shape = (
             w3_w1_weight_shape[0],
-            ceil_div(module.hidden_size, 32),  # block size of 32 for mxfp4
-            module.intermediate_size * 2,
+            w3_w1_weight_shape[1] //
+            16,  # block size of 32 for mxfp4, we already divided by 2 before so only divide by 16
+            w3_w1_weight_shape[2],
         )
 
         # The Triton kernel accepts the w2_weight in (num_experts, intermediate_dim, hidden_dim) format
         w2_weight_shape = (
             module.expert_size_per_partition,
-            module.intermediate_size_per_partition //
+            get_padded_size(module.intermediate_size_per_partition,
+                            self.k_alignment) //
             2,  # Two mxfp4 packed to a byte,
-            module.hidden_size,
+            get_padded_size(module.hidden_size, self.n_alignment),
         )
 
-        # Full scale is loaded at the beginning, later we will slice properly for TP
         w2_scale_shape = (
             w2_weight_shape[0],
-            ceil_div(module.intermediate_size,
-                     32),  # block size of 32 for mxfp4
+            w2_weight_shape[1] //
+            16,  # block size of 32 for mxfp4, we already divided by 2 before so only divide by 16
             w2_weight_shape[2],
         )
+
+        w3_w1_bias_shape = (w3_w1_weight_shape[0], w3_w1_weight_shape[2])
+        w2_bias_shape = (w2_weight_shape[0], w2_weight_shape[2])
 
         FusedMoEMethodBase.create_weights(self,
                                           module,
                                           weight_dtype,
                                           w3_w1_weight_shape,
                                           w2_weight_shape,
-                                          bias_dtype=torch.float32)
+                                          bias_dtype=torch.float32,
+                                          w3_w1_bias_shape=w3_w1_bias_shape,
+                                          w2_bias_shape=w2_bias_shape)
 
         fc31_dequant = nn.Parameter(
             torch.empty(w3_w1_scale_shape, dtype=torch.uint8),  # mxfp8 scale
@@ -826,20 +1129,27 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                  is_bias: bool = False):
         """
         Load w1 and w3 weights for each expert.
-        Override this method if you need to preprocess the weights differently.
         """
         device = dst_w3_w1_weight.device
         assert device.type == "cuda"
-        w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-        w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+        # Use full k-padding for float tensors, half for already-packed uint8
+        k_pad = self.k_alignment // 2 if w1_weight.dtype == torch.uint8 else self.k_alignment
+        # n is halved per-branch because we concatenate w1/w3 along N later
+        n_pad = self.n_alignment // 2
+        w1_weight_shard = shard_and_pad_tensor(w1_weight,
+                                               0,
+                                               n_pad,
+                                               k_pad,
+                                               module.tp_size,
+                                               module.tp_rank,
+                                               device=device)
+        w3_weight_shard = shard_and_pad_tensor(w3_weight,
+                                               0,
+                                               n_pad,
+                                               k_pad,
+                                               module.tp_size,
+                                               module.tp_rank,
+                                               device=device)
 
         if not is_bias and w3_weight_shard.dtype in (torch.bfloat16,
                                                      torch.float16,
@@ -885,12 +1195,14 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         """
         device = dst_w2_weight.device
         assert device.type == "cuda"
-        w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
-                                            device=device)
-
+        k_pad = self.k_alignment // 2 if w2_weight.dtype == torch.uint8 else self.k_alignment
+        w2_weight_shard = shard_and_pad_tensor(w2_weight,
+                                               1,
+                                               self.n_alignment,
+                                               k_pad,
+                                               module.tp_size,
+                                               module.tp_rank,
+                                               device=device)
         w2_scales = None
 
         if is_bias:
@@ -915,28 +1227,86 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         return w2_scales
 
     def _load_expert_w3_w1_weight_scale_mxfp4(
-            self, w1_weight_scale, w3_weight_scale,
-            dst_w3_w1_weight_scale: torch.Tensor, transpose_scales: bool):
+            self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
+            w3_weight_scale: torch.Tensor, dst_w3_w1_weight_scale: torch.Tensor,
+            transpose_scales: bool):
         if transpose_scales:
-            # (intermediate_dim * 2, hidden_dim / 32)
-            combined_scale = torch.cat([w3_weight_scale, w1_weight_scale],
-                                       dim=0)
-            # (hidden_dim / 32, intermediate_dim * 2)
-            combined_scale = combined_scale.transpose(0, 1)
-        else:
-            # (hidden_dim / 32, intermediate_dim * 2)
-            combined_scale = torch.cat([w3_weight_scale, w1_weight_scale],
-                                       dim=1)
+            w1_weight_scale = w1_weight_scale.transpose(
+                0, 1)  # (hidden_dim / 32, intermediate_dim)
+            w3_weight_scale = w3_weight_scale.transpose(
+                0, 1)  # (hidden_dim / 32, intermediate_dim)
+
+        # Swapping n_alignment and k_alignment here because we have already transposed
+        w1_weight_scale = shard_and_pad_tensor(
+            w1_weight_scale,
+            1,
+            self.k_alignment // 32,
+            self.n_alignment // 2,
+            module.tp_size,
+            module.tp_rank,
+            device=dst_w3_w1_weight_scale.device)
+
+        w3_weight_scale = shard_and_pad_tensor(
+            w3_weight_scale,
+            1,
+            self.k_alignment // 32,
+            self.n_alignment // 2,
+            module.tp_size,
+            module.tp_rank,
+            device=dst_w3_w1_weight_scale.device)
+
+        # (hidden_dim / 32, intermediate_dim * 2)
+        combined_scale = torch.cat([w3_weight_scale, w1_weight_scale], dim=1)
 
         dst_w3_w1_weight_scale.copy_(combined_scale, non_blocking=True)
 
-    def _load_expert_w2_weight_scale_mxfp4(self, w2_weight_scale,
+    def _load_expert_w2_weight_scale_mxfp4(self, module: torch.nn.Module,
+                                           w2_weight_scale: torch.Tensor,
                                            dst_w2_weight_scale: torch.Tensor,
                                            transpose_scales: bool):
         if transpose_scales:
             w2_weight_scale = w2_weight_scale.transpose(
                 0, 1)  # (intermediate_dim / 32, hidden_dim)
+
+        # k_alignment is divided by 32 because every 32 values share a single scale
+        # Swapping n_alignment and k_alignment here because we have already transposed
+        w2_weight_scale = shard_and_pad_tensor(
+            w2_weight_scale,
+            0,
+            self.k_alignment // 32,
+            self.n_alignment,
+            module.tp_size,
+            module.tp_rank,
+            device=dst_w2_weight_scale.device)
+
         dst_w2_weight_scale.copy_(w2_weight_scale, non_blocking=True)
+
+    @staticmethod
+    def _swizzle_and_replace(module, weight_name, scale_name, weight_data,
+                             scale_data):
+        new_weight, new_scale = swizzle_weight_and_scale(
+            weight_data, scale_data)
+        replacement_storage_ptrs = {
+            new_weight.data.untyped_storage().data_ptr(),
+            new_scale.data.untyped_storage().data_ptr(),
+        }
+        for name in (weight_name, scale_name):
+            old_param = module._parameters.pop(name, None)
+            assert old_param is not None, \
+                f"Expected {name} to be a registered parameter before swizzling MXFP4 weights."
+            old_storage = old_param.data.untyped_storage()
+            # The H20 MXFP4 swizzle fallback keeps tensors in their natural
+            # strided layout (wrap only, no conversion), so the replacement
+            # tensors alias the original storage, unlike the Hopper swizzled
+            # layout path. Only release storage that is no longer backing the
+            # replacement tensor.
+            old_storage_ptr = old_storage.data_ptr()
+            if (old_storage.nbytes() > 0
+                    and old_storage_ptr not in replacement_storage_ptrs):
+                old_storage.resize_(0)
+        torch.cuda.empty_cache()
+        setattr(module, weight_name, new_weight)
+        setattr(module, scale_name, new_scale)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
@@ -989,11 +1359,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             expert_idx = local_slot_id
 
             self._load_expert_w3_w1_weight_scale_mxfp4(
-                w1_weight_scale, w3_weight_scale,
+                module, w1_weight_scale, w3_weight_scale,
                 tmp_w3_w1_weight_scale[expert_idx], need_to_transpose_scales)
 
             self._load_expert_w2_weight_scale_mxfp4(
-                w2_weight_scale, tmp_w2_weight_scale[expert_idx],
+                module, w2_weight_scale, tmp_w2_weight_scale[expert_idx],
                 need_to_transpose_scales)
 
         self.w1_scales.clear()
@@ -1004,111 +1374,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight_scale = shuffle_weight_for_activation_kernel(
             tmp_w3_w1_weight_scale)
 
-        # For Hopper style swizzle, we need to pad the out dim to multiple of 256 otherwise it sometimes produces nan
-        def _maybe_pad_weight_and_scale(weight,
-                                        scale=None,
-                                        in_dim_padding_offset=0):
-            # Both weight and bias are handled here
-            assert weight.dim() in [2, 3], "Weight should be 2D or 3D tensor"
-            # out_dim padding is only required for Hopper
-            if torch.cuda.get_device_capability()[0] == 9:
-                out_dim = weight.shape[-1]
-                assert scale is None or scale.shape[
-                    -1] == out_dim, "Out dim of weight and scale should match"
-                pad_size = (self.out_dim_padding_multiple -
-                            out_dim % self.out_dim_padding_multiple
-                            ) % self.out_dim_padding_multiple
-                weight = F.pad(
-                    weight,
-                    (0, pad_size))  # Pad the last dimension on right side
-                if scale is not None:
-                    scale = F.pad(scale, (0, pad_size))
-            # in_dim padding is always required when we have TP because of mxfp4 scale block size
-            # We only do in_dim padding for weights but not for bias
-            if weight.dim() == 3:
-                in_dim = weight.shape[
-                    -2] * 2  # mxfp4 packs two values into one byte
-                assert scale is None or scale.shape[-2] == ceil_div(
-                    in_dim, 32), "In dim of weight and scale should match"
-                pad_size = (self.in_dim_padding_multiple -
-                            in_dim % self.in_dim_padding_multiple
-                            ) % self.in_dim_padding_multiple
-                assert pad_size % 2 == 0
-                pad_size //= 2  # pad_size is in mxfp4 units
-                assert in_dim_padding_offset % 2 == 0
-                in_dim_padding_offset //= 2
-                assert in_dim_padding_offset <= pad_size, "TP offset larger than pad size"
-                weight = F.pad(weight, (0, 0, in_dim_padding_offset,
-                                        pad_size - in_dim_padding_offset))
-                assert scale is not None  # Bias won't enter this branch
-                new_in_dim = weight.shape[-2] * 2
-                assert new_in_dim % 32 == 0
-                new_scale_in_dim = new_in_dim // 32
-                scale_pad_size = new_scale_in_dim - scale.shape[-2]
-                assert scale_pad_size >= 0
-                scale = F.pad(scale, (0, 0, 0, scale_pad_size))
-
-            return (weight, scale) if scale is not None else weight
-
-        # Handle w3_w1_weight
-
-        # Slice scales for TP
-        tp_slice_start = module.intermediate_size_per_partition * module.tp_rank
-        tp_slice_end = tp_slice_start + module.intermediate_size_per_partition
-        #(num_experts, in_dim / 32, out_dim)
-        assert tmp_w3_w1_weight_scale.dim() == 3
-        assert tmp_w3_w1_weight_scale.shape[-1] == module.intermediate_size * 2
-        # The scale is already shuffled
-        tmp_w3_w1_weight_scale = tmp_w3_w1_weight_scale[:, :, tp_slice_start *
-                                                        2:tp_slice_end * 2]
-
-        tmp_w3_w1_weight, tmp_w3_w1_weight_scale = _maybe_pad_weight_and_scale(
-            module.w3_w1_weight, tmp_w3_w1_weight_scale)
-
-        module._parameters.pop('w3_w1_weight', None)
-        module._parameters.pop('fc31_dequant', None)
-        torch.cuda.empty_cache()
-
-        tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
-            tmp_w3_w1_weight, tmp_w3_w1_weight_scale)
-
-        module.w3_w1_weight = tmp_w3_w1_weight
-        module.fc31_dequant = tmp_w3_w1_weight_scale
-
-        # Handle w2_weight
-
-        # Slice scales for TP
-        # TP might make the weight start from half of the mxfp4 32 block
-        # For example, if we start from index 20, there are 12 elements in the first block instead of 32
-        # We need to pad 20 elements to the first block
-        self.w2_tp_offset = tp_slice_start % 32
-        assert tmp_w2_weight_scale.dim() == 3
-        # assert tmp_w2_weight_scale.shape[-2] * 32 == module.intermediate_size
-        # We skip this assert to allow intermidiate_size not divisible by 32, this is used in the unit test to test TP shapes in a single gpu
-        scale_slice_start = tp_slice_start // 32
-        scale_slice_end = (tp_slice_end - 1) // 32 + 1
-        tmp_w2_weight_scale = tmp_w2_weight_scale[:, scale_slice_start:
-                                                  scale_slice_end, :]
-
-        tmp_w2_weight, tmp_w2_weight_scale = _maybe_pad_weight_and_scale(
-            module.w2_weight, tmp_w2_weight_scale, self.w2_tp_offset)
-
-        module._parameters.pop('w2_weight', None)
-        module._parameters.pop('fc2_dequant', None)
-        torch.cuda.empty_cache()
-
-        tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
-            tmp_w2_weight, tmp_w2_weight_scale)
-
-        module.w2_weight = tmp_w2_weight
-        module.fc2_dequant = tmp_w2_weight_scale
-
-        # Bias needs to be padded as well.
-        if module.bias:
-            module.w3_w1_bias.data = _maybe_pad_weight_and_scale(
-                module.w3_w1_bias.data)
-            module.w2_bias.data = _maybe_pad_weight_and_scale(
-                module.w2_bias.data)
+        self._swizzle_and_replace(module, 'w3_w1_weight', 'fc31_dequant',
+                                  module.w3_w1_weight.data,
+                                  tmp_w3_w1_weight_scale)
+        self._swizzle_and_replace(module, 'w2_weight', 'fc2_dequant',
+                                  module.w2_weight.data, tmp_w2_weight_scale)
 
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
@@ -1120,8 +1390,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 module.fc2_input_dequant.data.copy_(max_fc2_input_scale,
                                                     non_blocking=True)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         if self.activation_dtype == torch.float8_e4m3fn:
             if module.fc31_input_dequant is None:
@@ -1161,16 +1434,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         # Step 2: Gemm1
         # Setup quantization context
-        def _maybe_pad_activation(hidden_states, in_dim_padding_offset):
-            assert hidden_states.dim() == 2, "Hidden states should be 2D tensor"
-            in_dim = hidden_states.shape[-1]
-            pad_size_in = (self.in_dim_padding_multiple -
-                           in_dim % self.in_dim_padding_multiple
-                           ) % self.in_dim_padding_multiple
-            assert in_dim_padding_offset <= pad_size_in
-            padding = (in_dim_padding_offset,
-                       pad_size_in - in_dim_padding_offset)
-            hidden_states = F.pad(hidden_states, padding)
+        def _maybe_pad_activation(hidden_states):
+            k_dim = hidden_states.shape[-1]
+            padded_k_dim = get_padded_size(k_dim, self.k_alignment)
+            hidden_states = torch.nn.functional.pad(hidden_states,
+                                                    (0, padded_k_dim - k_dim))
             return hidden_states
 
         if self.activation_dtype == torch.float8_e4m3fn:
@@ -1178,7 +1446,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 lhs_data=InFlexData(scale=hidden_states_scale), )
         else:
             flex_ctx_1 = FlexCtx()
-        pc1 = PrecisionConfig(weight_scale=gemm1_scales,
+        pc1 = PrecisionConfig(b_mx_scale=gemm1_scales,
                               flex_ctx=flex_ctx_1,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1186,38 +1454,30 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Call the Triton gemm kernel, which also does permutation and activation
         alpha = module.swiglu_alpha or 1.0
         beta = module.swiglu_beta or 0.0
-        hidden_states = _maybe_pad_activation(hidden_states, 0)
+        hidden_states = _maybe_pad_activation(hidden_states)
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
 
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1,
-                                 fused_activation=act)
+            act_out = matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+                gather_indx=gather_indx,
+                precision_config=pc1,
+                fused_activation=act)
         else:
-            act_out = matmul_ogs(hidden_states,
-                                 gemm1_weights,
-                                 module.w3_w1_bias if module.bias else None,
-                                 rdata,
-                                 gather_indx=gather_indx,
-                                 precision_config=pc1)
+            act_out = matmul(
+                hidden_states,
+                gemm1_weights,
+                module.w3_w1_bias if module.bias else None,
+                a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+                gather_indx=gather_indx,
+                precision_config=pc1)
             act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
-
-        def _maybe_remove_padding(gemm_output, expected_size):
-            assert gemm_output.dim() == 2
-            if gemm_output.shape[-1] != expected_size:
-                assert gemm_output.shape[
-                    -1] % 128 == 0, "The padding is not done correctly"
-                gemm_output = gemm_output[:, :expected_size]
-            return gemm_output
-
-        act_out = _maybe_remove_padding(
-            act_out, module.intermediate_size_per_partition).contiguous()
 
         if self.activation_dtype == torch.float8_e4m3fn:
             # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
@@ -1235,26 +1495,128 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             flex_ctx_2 = FlexCtx(lhs_data=InFlexData(scale=act_scale), )
         else:
             flex_ctx_2 = FlexCtx()
-        pc2 = PrecisionConfig(weight_scale=gemm2_scales,
+        pc2 = PrecisionConfig(b_mx_scale=gemm2_scales,
                               flex_ctx=flex_ctx_2,
                               allow_tf32=False,
                               out_dtype=module.dtype)
 
-        # Call the Triton kernel, which also does finalization
-        act_out = _maybe_pad_activation(act_out, self.w2_tp_offset)
-        gemm2_output = matmul_ogs(act_out,
-                                  gemm2_weights,
-                                  module.w2_bias if module.bias else None,
-                                  rdata,
-                                  scatter_indx=scatter_indx,
-                                  precision_config=pc2,
-                                  gammas=rdata.gate_scal if rdata else None)
+        # Call the Triton kernel, which also does the scatter into
+        # token-major order; the top-k combine is done explicitly below.
+        gemm2_output = matmul(
+            act_out,
+            gemm2_weights,
+            module.w2_bias if module.bias else None,
+            a_ragged_metadata=rdata.ragged_metadata if rdata else None,
+            scatter_indx=scatter_indx,
+            precision_config=pc2,
+            gammas=rdata.gate_scal if rdata else None)
+        gemm2_output = combine_expert_outputs(gemm2_output, rdata)
+
+        def _maybe_remove_padding(gemm_output, expected_size):
+            assert gemm_output.dim() == 2
+            if gemm_output.shape[-1] != expected_size:
+                assert gemm_output.shape[
+                    -1] % self.k_alignment == 0, "The padding is not done correctly"
+                # Materialize instead of returning the slice view: downstream
+                # kernels that take a bare data pointer and derive the row
+                # stride from the hidden size (e.g. lora_grouped_gemm) would
+                # read every row but the first at the wrong offset. The other
+                # MoE backends already emit dense output.
+                gemm_output = gemm_output[:, :expected_size].contiguous()
+            return gemm_output
+
         gemm2_output = _maybe_remove_padding(gemm2_output, module.hidden_size)
 
         return gemm2_output
 
+    def transform_weights(self, module: torch.nn.Module) -> None:
+        if 'w3_w1_weight' in module._parameters:
+            w31_scale = shuffle_weight_for_activation_kernel(
+                module.fc31_dequant.data)
+            self._swizzle_and_replace(module, 'w3_w1_weight', 'fc31_dequant',
+                                      module.w3_w1_weight.data, w31_scale)
+            self._swizzle_and_replace(module, 'w2_weight', 'fc2_dequant',
+                                      module.w2_weight.data,
+                                      module.fc2_dequant.data)
+
+            if self.activation_dtype == torch.float8_e4m3fn:
+                module.fc31_input_dequant = None
+                module.fc2_input_dequant = None
+
+        super().transform_weights(module)
+
 
 class TritonFusedMoE(MoE):
+
+    @classmethod
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Triton MoE: SM90 only, and only the gpt-oss style swiglu.
+
+        Supports unquantized BF16, FP8 per-tensor QDQ, W4A8_MXFP4_FP8 and
+        W4A16_MXFP4.
+        """
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
+
+        # TritonFusedMoE only supports SM90
+        if sm_version != 90:
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
+                f"TritonFusedMoE only supports SM90, got SM{sm_version}")
+
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "TritonFusedMoE does not implement the EPLB slot hooks")
+
+        # Require gpt-oss SwiGLU; abstain when the style is unknown.
+        if p.swiglu_gptoss_style is False:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "TritonFusedMoE only supports swiglu_gptoss_style=True")
+
+        if d.smart_router:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"TritonFusedMoE has no smart-router path (moe_cluster_size="
+                f"{d.cluster_size})")
+
+        # Require renormalize-family routing; abstain when routing is unknown.
+        routing_type = p.routing_method_type
+        if routing_type is not None and not issubclass(
+                ROUTING_METHOD_TYPE_TO_CLASS[routing_type],
+                RenormalizeMoeRoutingMethod):
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"TritonFusedMoE fuses renormalize routing only, got {p.routing}"
+            )
+
+        # Unquantized mode - only bfloat16 is supported
+        if quant_algo is None:
+            if p.dtype_act != torch.bfloat16:
+                return _reject(
+                    MoERejectReason.DTYPE_UNSUPPORTED,
+                    f"TritonFusedMoE unquantized mode only supports bfloat16, got {p.dtype_act}"
+                )
+            return MoEEligibility.ok()
+
+        # FP8 per-tensor (QDQ) and W4A8_MXFP4_FP8 - no activation dtype restriction
+        if quant_algo in {QuantAlgo.FP8, QuantAlgo.W4A8_MXFP4_FP8}:
+            return MoEEligibility.ok()
+
+        # W4A16_MXFP4 - only bfloat16 and float16 are supported
+        if quant_algo == QuantAlgo.W4A16_MXFP4:
+            if p.dtype_act not in {torch.bfloat16, torch.float16}:
+                return _reject(
+                    MoERejectReason.DTYPE_UNSUPPORTED,
+                    f"TritonFusedMoE W4A16_MXFP4 only supports bfloat16 or float16, "
+                    f"got {p.dtype_act}")
+            return MoEEligibility.ok()
+
+        # Unsupported quantization algorithm
+        return _reject(
+            MoERejectReason.QUANT_UNSUPPORTED,
+            f"TritonFusedMoE does not support quant_algo={quant_algo}")
 
     def __init__(
         self,
@@ -1285,15 +1647,8 @@ class TritonFusedMoE(MoE):
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
         )
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            raise ImportError("Triton kernels are not available.")
-        if torch.cuda.get_device_capability()[0] != 9 and self.ep_size > 1:
-            raise NotImplementedError(
-                "TritonFusedMoE is only supported on Hopper with EP size > 1.")
-
-        assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
-            "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
-        assert not self.smart_router, "Smart router is not supported in TritonFusedMoE."
+        # Eligibility (SM / routing / smart_router / quant) is owned by
+        # ``can_implement``; do not re-assert it here.
 
         self.num_slots = self.num_experts
         self.expert_size_per_partition = self.num_experts // self.ep_size
@@ -1361,6 +1716,7 @@ class TritonFusedMoE(MoE):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -1370,7 +1726,8 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        hidden_states = self.quant_method.apply(self, x, router_logits)
+        hidden_states = self.quant_method.apply(self, x, router_logits,
+                                                input_ids)
 
         final_hidden_states = self.reducescatter_or_allreduce(
             hidden_states,
@@ -1379,12 +1736,12 @@ class TritonFusedMoE(MoE):
 
         return final_hidden_states
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        assert not allow_partial_loading, "Partial loading is not supported for TritonFusedMoE now"
         assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)

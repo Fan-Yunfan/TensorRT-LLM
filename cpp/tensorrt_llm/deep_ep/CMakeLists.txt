@@ -1,4 +1,4 @@
-set(DEEP_EP_COMMIT 5be51b228a7c82dbdb213ea58e77bffd12b38af8)
+get_property(DEEP_EP_COMMIT GLOBAL PROPERTY DEEP_EP_COMMIT)
 set(NVSHMEM_URL_HASH
     SHA256=eb2c8fb3b7084c2db86bd9fd905387909f1dfd483e7b45f7b3c3d5fcf5374b5a)
 
@@ -58,15 +58,6 @@ find_library(MLX5_lib NAMES mlx5 REQUIRED)
 
 # Download DeepEP
 include(FetchContent)
-if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
-  set(GITHUB_URL "$ENV{GITHUB_MIRROR}")
-else()
-  set(GITHUB_URL "https://github.com")
-endif()
-set(DEEP_EP_URL
-    "${GITHUB_URL}/deepseek-ai/DeepEP/archive/${DEEP_EP_COMMIT}.tar.gz")
-message(STATUS "deep_ep DEEP_EP_URL: ${DEEP_EP_URL}")
-FetchContent_Declare(deep_ep_download URL ${DEEP_EP_URL})
 FetchContent_MakeAvailable(deep_ep_download)
 set(DEEP_EP_SOURCE_DIR ${deep_ep_download_SOURCE_DIR})
 
@@ -129,6 +120,15 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_C_COMPILER gcc)
   set(CMAKE_CXX_COMPILER g++)
   set(CMAKE_CUDA_HOST_COMPILER g++)
+  # PyTorch's cmake/public/cuda.cmake (loaded transitively by
+  # find_package(Torch)) appends -Xcompiler=-fclang-abi-compat=17 to
+  # CMAKE_CUDA_FLAGS whenever the parent build is configured with Clang>=18 (see
+  # pytorch PR #175233). Since this subdirectory falls back to GCC for NVSHMEM
+  # compatibility, that Clang-only flag would be forwarded to g++ via `nvcc
+  # -ccbin=g++` and abort the build with: g++: error: unrecognized command-line
+  # option '-fclang-abi-compat=17'
+  string(REGEX REPLACE "-Xcompiler=-fclang-abi-compat=[0-9]+" ""
+                       CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 endif()
 
 # Add nvshmem external project
@@ -213,6 +213,12 @@ target_compile_options(
 target_compile_definitions(
   deep_ep_cpp_tllm PRIVATE DISABLE_AGGRESSIVE_PTX_INSTRS
                            TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
+# Newer CUDA containers provide NVSHMEM headers in the default CUDA include
+# directory. DeepEP must compile against the vendored NVSHMEM headers because it
+# links the vendored NVSHMEM static library below.
+target_include_directories(
+  deep_ep_cpp_tllm BEFORE
+  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
 target_link_libraries(
   deep_ep_cpp_tllm PRIVATE nvshmem_project::nvshmem ${TORCH_LIBRARIES}
                            ${TORCH_PYTHON_LIB})

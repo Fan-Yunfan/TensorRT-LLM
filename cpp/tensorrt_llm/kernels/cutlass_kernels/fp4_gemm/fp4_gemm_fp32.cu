@@ -15,9 +15,10 @@
  */
 
 #include "fp4_gemm_template.h"
+#include "tensorrt_llm/common/config.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -78,7 +79,9 @@ INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_SM120(float, 256, 128, 128, 1, 1, 1)
 
 template class CutlassFp4GemmRunner<float, FP4GemmType::W4A4_NVFP4_NVFP4>;
 template class CutlassFp4GemmRunner<float, FP4GemmType::W4A8_MXFP4_MXFP8>;
+template class CutlassFp4GemmRunner<float, FP4GemmType::W8A8_MXFP8_MXFP8>;
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

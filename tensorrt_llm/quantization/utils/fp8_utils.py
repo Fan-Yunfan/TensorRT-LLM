@@ -51,45 +51,103 @@ def per_token_cast_to_fp8_e8m0(
             g, m, n), sf
 
 
-def per_block_cast_to_fp8_e8m0(
-        x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    if x.dim() == 2:
-        m, n = x.shape
-        x_padded = torch.zeros((align(m, 128), align(n, 128)),
-                               dtype=x.dtype,
-                               device=x.device)
-        x_padded[:m, :n] = x
-        x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
-        x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-        sf = ceil_to_ue8m0(x_amax / 448.0)
-        x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-        return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
-            x_view.size(0), x_view.size(2))
-    else:
-        g, m, n = x.shape
-        x_padded = torch.zeros((g, align(m, 128), align(n, 128)),
-                               dtype=x.dtype,
-                               device=x.device)
-        x_padded[:, :m, :n] = x
-        x_view = x_padded.view(g, -1, 128, x_padded.size(-1) // 128, 128)
-        x_amax = x_view.abs().float().amax(dim=(2, 4), keepdim=True).clamp(1e-4)
-        sf = ceil_to_ue8m0(x_amax / 448.0)
-        x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-        return x_scaled.view_as(x_padded)[:, :m, :n].contiguous(), sf.view(
-            x_view.size(0), x_view.size(1), x_view.size(3))
+@triton.jit
+def _resmooth_kernel(
+    w_ptr,
+    s_ptr,
+    M,
+    K,
+    stride_wb,
+    stride_wm,
+    stride_wk,
+    stride_sb,
+    stride_sm,
+    stride_sk,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    curr_w_ptr = w_ptr + batch_idx * stride_wb
+    curr_s_ptr = s_ptr + batch_idx * stride_sb
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    s_offset = pid_m * stride_sm + pid_k * stride_sk
+    old_scale = tl.load(curr_s_ptr + s_offset)
+
+    w_mask = (rm[:, None] < M) & (rk[None, :] < K)
+    w_offsets = rm[:, None] * stride_wm + rk[None, :] * stride_wk
+    w_fp8 = tl.load(curr_w_ptr + w_offsets, mask=w_mask, other=0.0)
+    w_fp32 = w_fp8.to(tl.float32)
+
+    w_val = w_fp32 * old_scale
+    block_amax = tl.maximum(tl.max(tl.abs(w_val)), 1e-4)
+
+    # UE8M0 sf = 2 ^ ceil(log2(sf))
+    new_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(block_amax / 448.0)))
+    w_requant = w_val * (1.0 / new_scale)
+
+    tl.store(curr_w_ptr + w_offsets, w_requant, mask=w_mask)
+    tl.store(curr_s_ptr + s_offset, new_scale)
 
 
-def resmooth_to_fp8_e8m0(weight: torch.Tensor,
-                         sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def resmooth_to_fp8_e8m0(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_size: tuple[int, int] = (128, 128),
+):
+    assert weight.dtype == torch.float8_e4m3fn
+    assert weight_scale.dtype == torch.float32
+
     weight = weight.cuda()
-    sf = sf.cuda()
-    if weight.dim() == 2:
-        x = weight.float() * sf.repeat_interleave(128, dim=0).repeat_interleave(
-            128, dim=1)[:weight.shape[0], :weight.shape[1]]
+    weight_scale = weight_scale.cuda()
+
+    orig_shape = weight.shape
+    M, K = orig_shape[-2:]
+    w_view = weight.view(-1, M, K)
+    s_view = weight_scale.view(-1, weight_scale.shape[-2],
+                               weight_scale.shape[-1])
+
+    num_batches = w_view.shape[0]
+    BLOCK_M, BLOCK_K = block_size
+
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_k = triton.cdiv(K, BLOCK_K)
+    blocks_per_batch = grid_m * grid_k
+
+    # Workaround for Triton compiler/runtime bug on SM100f (Blackwell):
+    # CUDA illegal memory access when total grid blocks exceed ~65K.
+    # Split launches along the batch dimension to stay under the limit.
+    MAX_GRID_BLOCKS = 65536
+    if blocks_per_batch > 0:
+        max_batches_per_launch = max(1, MAX_GRID_BLOCKS // blocks_per_batch)
     else:
-        x = weight.float() * sf.repeat_interleave(128, dim=1).repeat_interleave(
-            128, dim=2)[:weight.shape[0], :weight.shape[1], :weight.shape[2]]
-    return per_block_cast_to_fp8_e8m0(x)
+        max_batches_per_launch = num_batches
+
+    for batch_offset in range(0, num_batches, max_batches_per_launch):
+        batch_count = min(max_batches_per_launch, num_batches - batch_offset)
+        grid = (batch_count, grid_m, grid_k)
+
+        _resmooth_kernel[grid](
+            w_view[batch_offset:],
+            s_view[batch_offset:],
+            M,
+            K,
+            w_view.stride(0),
+            w_view.stride(1),
+            w_view.stride(2),
+            s_view.stride(0),
+            s_view.stride(1),
+            s_view.stride(2),
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=BLOCK_K,
+        )
+    # this is an in-place operation, however, we return for simplicity
+    return weight, weight_scale
 
 
 def get_m_alignment_for_contiguous_layout():
@@ -163,6 +221,78 @@ def check_sf_layout(sf: torch.Tensor,
         assert sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size())
 
     return sf
+
+
+def unpack_col_major_tma_aligned_packed_tensor(
+    packed: torch.Tensor,
+    mn: int,
+    k: int,
+) -> torch.Tensor:
+    """Inverse of :func:`get_col_major_tma_aligned_packed_tensor`.
+
+    Recovers a ``(mn, k)`` float32 UE8M0 scale tensor from the packed
+    int32 col-major layout produced by the forward transform.
+
+    Only valid when the original scales were UE8M0 (all power-of-two),
+    which is guaranteed after :func:`resmooth_to_fp8_e8m0`.
+    """
+    assert packed.dtype == torch.int
+
+    remove_dim = False
+    if packed.dim() == 2:
+        packed = packed.unsqueeze(0)
+        remove_dim = True
+    b = packed.shape[0]
+
+    aligned_mn = get_tma_aligned_size(mn, 4)  # int32 element_size = 4
+    aligned_k = align(k, 4)
+
+    # The packed tensor may have col-major strides from the forward
+    # transform.  Flatten to 1-D via clone() so dtype views always work.
+    packed.shape[-2] * packed.shape[-1]
+    flat_int = packed.reshape(b, -1).clone()  # (b, mn * cols) contiguous
+
+    # Pad mn back to aligned_mn (forward sliced [:mn])
+    if mn < aligned_mn:
+        extra = (aligned_mn - mn) * packed.shape[-1]
+        pad = torch.zeros(b, extra, device=packed.device, dtype=torch.int)
+        flat_int = torch.cat([flat_int, pad], dim=1)
+        aligned_mn * packed.shape[-1]
+
+    # int32 → uint8: 4 bytes per element
+    flat_bytes = flat_int.view(torch.uint8)  # (b, n_int32 * 4)
+    unpacked = flat_bytes.view(b, aligned_mn, aligned_k)
+
+    # Slice away padding, reconstruct float32 from UE8M0 exponent byte
+    ue8m0 = unpacked[:, :mn, :k]  # (b, mn, k) uint8
+    float_bits = ue8m0.to(torch.int32) << 23
+    result = float_bits.reshape(b, -1).view(torch.float32).reshape(b, mn, k)
+
+    return result.squeeze(0) if remove_dim else result
+
+
+def inverse_transform_sf(
+    sf: torch.Tensor,
+    mn: int,
+    k: int,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Recover a ``(nb_m, nb_k)`` float32 block-scale grid from a packed SF.
+
+    This reverses the ``(FP32, 128, 128) → (INT, 1, 128)`` path in
+    :func:`transform_sf_into_required_layout` (the path taken by
+    ``FP8BlockScalesLinearMethod.post_load_weights`` on SM100f / SM120).
+    """
+    nb_k = ceil_div(k, block_size)
+
+    # Step 1: unpack to per-row float32 UE8M0 grid  (mn, nb_k)
+    per_row = unpack_col_major_tma_aligned_packed_tensor(sf, mn, nb_k)
+
+    # Step 2: collapse replicated rows back to (nb_m, nb_k).
+    # Forward did index_select with indices = arange(mn) // block_size,
+    # so rows within a 128-block are identical.  Take one per block.
+    per_block = per_row[::block_size]  # (nb_m, nb_k)
+    return per_block
 
 
 @nvtx_range("[DG] transform_sf_into_required_layout")
@@ -239,6 +369,8 @@ def _silu_and_mul_post_quant_kernel(
     BLOCK: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -278,6 +410,15 @@ def _silu_and_mul_post_quant_kernel(
                 mask=local_mask < size_k,
                 other=0.0,
             ).to(tl.float32)
+            if HAS_SWIGLU_LIMIT:
+                # gate is fp32; clamp directly. up is in input dtype (bf16/fp16);
+                # cast the limit constant to that dtype to avoid a fp32 round-trip
+                # on every element.
+                gate = tl.minimum(gate, SWIGLU_LIMIT)
+                limit_native = tl.cast(SWIGLU_LIMIT, input_ptr.dtype.element_ty)
+                neg_limit_native = tl.cast(-SWIGLU_LIMIT,
+                                           input_ptr.dtype.element_ty)
+                up = tl.maximum(tl.minimum(up, limit_native), neg_limit_native)
             gate = gate / (1 + tl.exp(-gate))
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
@@ -308,6 +449,7 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     """
     input shape [g, m, k]
@@ -315,6 +457,11 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale [g, k // 4, m // 2 // 128], dtype int32
     quant_group_size int
     masked_m shape [g]
+    swiglu_limit optional Python float (uniform across experts); when provided,
+        the gate input is clamped to (-inf, limit] before silu and the up
+        branch is clamped to [-limit, limit] before the multiply. Baked into
+        the kernel as a constexpr — caller supplies a host-side float, no
+        per-expert tensor / global load.
     """
 
     assert input.is_contiguous()
@@ -347,6 +494,10 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_NUM_PER_EXPERT,
         expert_num,
     )
+    # Gate on > 0 (matching torch.ops.trtllm.silu_and_mul) so a 0.0/negative
+    # limit is a no-op clamp rather than collapsing all activations to 0.
+    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0.0
+    swiglu_limit_value = float(swiglu_limit) if has_swiglu_limit else 0.0
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -362,6 +513,8 @@ def silu_and_mul_masked_post_quant_fwd(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        SWIGLU_LIMIT=swiglu_limit_value,
     )
     output_scale = output_scale.transpose(1, 2)[:, :m, :]
     check_sf_layout(
@@ -380,12 +533,15 @@ def _per_token_quant_and_transform_kernel(
     input_ptr,
     stride_input_0,
     stride_input_1,
+    stride_input_2,
     output_ptr,
     stride_output_0,
     stride_output_1,
+    stride_output_2,
     output_scale_ptr,
     stride_output_scale_0,
     stride_output_scale_1,
+    stride_output_scale_2,
     token_num_cur_expert,
     size_k,
     fp8_max,
@@ -394,7 +550,7 @@ def _per_token_quant_and_transform_kernel(
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
 ):
-    tl.program_id(2)
+    batch_id = tl.program_id(2)
     token_id = tl.program_id(1)
     hidden_dim_block_index = tl.program_id(0)
 
@@ -402,14 +558,19 @@ def _per_token_quant_and_transform_kernel(
 
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
     stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_output_scale_0 = tl.cast(stride_output_scale_0, dtype=tl.int64)
     stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
     stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+    stride_output_scale_1 = tl.cast(stride_output_scale_1, dtype=tl.int64)
+    stride_input_2 = tl.cast(stride_input_2, dtype=tl.int64)
+    stride_output_2 = tl.cast(stride_output_2, dtype=tl.int64)
+    stride_output_scale_2 = tl.cast(stride_output_scale_2, dtype=tl.int64)
 
     offs_in_d = hidden_dim_block_index * BLOCK + tl.arange(0, BLOCK // 4)
-    input_ptr_offs = input_ptr + offs_in_d
-    output_ptr_offs = output_ptr + offs_in_d
-    output_scale_offs = (output_scale_ptr +
-                         hidden_dim_block_index * stride_output_scale_0)
+    input_ptr_offs = input_ptr + batch_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + batch_id * stride_output_0 + offs_in_d
+    output_scale_offs = (output_scale_ptr + batch_id * stride_output_scale_0 +
+                         hidden_dim_block_index * stride_output_scale_1)
 
     for token_index in tl.range(token_id,
                                 token_num_cur_expert,
@@ -419,7 +580,7 @@ def _per_token_quant_and_transform_kernel(
         for pack_index in tl.range(4):
             local_mask = offs_in_d + pack_index * 128
             act = tl.load(
-                input_ptr_offs + token_index * stride_input_0 +
+                input_ptr_offs + token_index * stride_input_1 +
                 pack_index * 128,
                 mask=local_mask < size_k,
                 other=0.0,
@@ -433,13 +594,13 @@ def _per_token_quant_and_transform_kernel(
             output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
                                (8 * pack_index))
             tl.store(
-                output_ptr_offs + token_index * stride_output_0 +
+                output_ptr_offs + token_index * stride_output_1 +
                 pack_index * 128,
                 output_q,
                 mask=local_mask < size_k,
             )
         tl.store(
-            output_scale_offs + token_index * stride_output_scale_1,
+            output_scale_offs + token_index * stride_output_scale_2,
             output_s_int32,
         )
 
@@ -448,6 +609,7 @@ def per_token_quant_and_transform(
     input: torch.Tensor,
     quant_group_size: int = 128,
     scale_ue8m0: bool = True,
+    need_permute102: bool = False,
 ):
     """
     input shape [g, m, k]
@@ -457,8 +619,6 @@ def per_token_quant_and_transform(
     masked_m shape [g]
     """
 
-    assert input.is_contiguous()
-    assert len(input.shape) == 2
     assert input.shape[-1] % 2 == 0
 
     # FP8 quantization parameters
@@ -466,17 +626,29 @@ def per_token_quant_and_transform(
     fp8_max = finfo.max
     fp8_min = -fp8_max
 
-    m, k = input.shape
+    b = 1
+    original_input_rank = len(input.shape)
+    if (original_input_rank == 2):
+        assert input.is_contiguous()
+        input = input.unsqueeze(0)
+        b, m, k = input.shape
+    elif (original_input_rank == 3):
+        if need_permute102:
+            input = input.transpose(0, 1)
+        b, m, k = input.shape
+    else:
+        raise AssertionError(
+            f"Unsupported input shape rank: {original_input_rank}")
 
     # Create output
-    output = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    output = torch.empty((b, m, k), dtype=torch.float8_e4m3fn, device="cuda")
 
     # Create output scale
     alignment = 4
     scale_k = ceil_div(k, quant_group_size)
     m_padded = align(m, alignment)
     scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.empty((scale_k_padded // 4, m_padded),
+    output_scale = torch.empty((b, scale_k_padded // 4, m_padded),
                                dtype=torch.int32,
                                device='cuda')
 
@@ -490,7 +662,7 @@ def per_token_quant_and_transform(
     grid = (
         hidden_dim_split_block_num,
         BLOCK_NUM_PER_EXPERT,
-        1,
+        b,
     )
     _per_token_quant_and_transform_kernel[grid](
         input,
@@ -508,13 +680,32 @@ def per_token_quant_and_transform(
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
     )
-    output_scale = output_scale.transpose(0, 1)[:m, :]
+    if (original_input_rank == 2):
+        output = output.squeeze(0)
+        output_scale = output_scale.squeeze(0)
+        output_scale = output_scale.transpose(0, 1)[:m, :]
+    else:
+        output_scale = output_scale.transpose(1, 2)[:, :m, :]
+
     check_sf_layout(
         output_scale,
         m,
         k,
         (1, 128),
-        num_groups=None,
+        num_groups=b if original_input_rank == 3 else None,
         tma_stride_check=True,
     )
     return output, output_scale
+
+
+def fp8_quantize_1x128_sf_transpose(
+        x: torch.Tensor,
+        use_ue8m0: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_fp8, x_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=use_ue8m0)
+    if x_scale.ndim == 1:  # Handle SM version differences (SM90: 1D padded, SM100+: 2D)
+        x_padded = (x.shape[0] + 3) // 4 * 4
+        num_blocks = (x.shape[1] + 127) // 128
+        x_scale = x_scale[:x_padded * num_blocks].view(num_blocks,
+                                                       x_padded)[:, :x.shape[0]]
+    x_scale = x_scale.contiguous().transpose(0, 1)
+    return x_fp8, x_scale

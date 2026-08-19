@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -28,14 +28,22 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+// Generate a unique agent name for NIXL/UCX connection identity.
+// Format: {hostname}_{pid}_{random64}_{counter}
+// The per-process random suffix prevents collisions across Docker containers
+// that share hostname (--network host) and PID namespace.
+std::string genUniqueAgentName();
+
 struct RequestAndBufferInfo
 {
     std::string mAgentName;
     std::string mAddress;
     batch_manager::RequestInfo mRequestInfo;
-    MemoryDesc mBufferDesc;
+    std::vector<MemoryDesc> mBufferDescs;
     std::optional<std::string> mMetadata;
     int mValidConnectionIdx;
+    std::vector<uint8_t> mBufferKinds;
 
     static void serialize(RequestAndBufferInfo const& requestAndBufferInfo, std::ostream& os)
     {
@@ -43,9 +51,18 @@ struct RequestAndBufferInfo
         su::serialize(requestAndBufferInfo.mAgentName, os);
         su::serialize(requestAndBufferInfo.mAddress, os);
         batch_manager::RequestInfo::serialize(requestAndBufferInfo.mRequestInfo, os);
-        MemoryDesc::serialize(requestAndBufferInfo.mBufferDesc, os);
+        su::serialize(requestAndBufferInfo.mBufferDescs.size(), os);
+        for (auto const& bufferDesc : requestAndBufferInfo.mBufferDescs)
+        {
+            MemoryDesc::serialize(bufferDesc, os);
+        }
         su::serialize(requestAndBufferInfo.mMetadata, os);
         su::serialize(requestAndBufferInfo.mValidConnectionIdx, os);
+        su::serialize(requestAndBufferInfo.mBufferKinds.size(), os);
+        for (auto kind : requestAndBufferInfo.mBufferKinds)
+        {
+            su::serialize(kind, os);
+        }
     }
 
     static RequestAndBufferInfo deserialize(std::istream& is)
@@ -54,20 +71,43 @@ struct RequestAndBufferInfo
         auto agentName = su::deserialize<decltype(mAgentName)>(is);
         auto address = su::deserialize<decltype(mAddress)>(is);
         auto requestInfo = batch_manager::RequestInfo::deserialize(is);
-        auto bufferDesc = MemoryDesc::deserialize(is);
+        auto bufferDescsSize = su::deserialize<decltype(mBufferDescs.size())>(is);
+        std::vector<MemoryDesc> bufferDescs;
+        bufferDescs.reserve(bufferDescsSize);
+        for (size_t i = 0; i < bufferDescsSize; i++)
+        {
+            bufferDescs.emplace_back(MemoryDesc::deserialize(is));
+        }
         auto metadata = su::deserialize<decltype(mMetadata)>(is);
         auto validConnectionIdx = su::deserialize<decltype(mValidConnectionIdx)>(is);
-        return RequestAndBufferInfo{agentName, address, requestInfo, bufferDesc, metadata, validConnectionIdx};
+        auto bufferKindsSize = su::deserialize<size_t>(is);
+        std::vector<uint8_t> bufferKinds;
+        bufferKinds.reserve(bufferKindsSize);
+        for (size_t i = 0; i < bufferKindsSize; i++)
+        {
+            bufferKinds.push_back(su::deserialize<uint8_t>(is));
+        }
+        return RequestAndBufferInfo{
+            agentName, address, requestInfo, bufferDescs, metadata, validConnectionIdx, bufferKinds};
     }
 
     static size_t serializedSize(RequestAndBufferInfo const& requestAndBufferInfo)
     {
         namespace su = executor::serialize_utils;
-        return su::serializedSize(requestAndBufferInfo.mAgentName) + su::serializedSize(requestAndBufferInfo.mAddress)
-            + batch_manager::RequestInfo::serializedSize(requestAndBufferInfo.mRequestInfo)
-            + MemoryDesc::serializedSize(requestAndBufferInfo.mBufferDesc)
-            + su::serializedSize(requestAndBufferInfo.mMetadata)
-            + su::serializedSize(requestAndBufferInfo.mValidConnectionIdx);
+        size_t totalSize = 0;
+        totalSize += su::serializedSize(requestAndBufferInfo.mAgentName);
+        totalSize += su::serializedSize(requestAndBufferInfo.mAddress);
+        totalSize += batch_manager::RequestInfo::serializedSize(requestAndBufferInfo.mRequestInfo);
+        totalSize += su::serializedSize(requestAndBufferInfo.mBufferDescs.size());
+        for (auto const& bufferDesc : requestAndBufferInfo.mBufferDescs)
+        {
+            totalSize += MemoryDesc::serializedSize(bufferDesc);
+        }
+        totalSize += su::serializedSize(requestAndBufferInfo.mMetadata);
+        totalSize += su::serializedSize(requestAndBufferInfo.mValidConnectionIdx);
+        totalSize += su::serializedSize(requestAndBufferInfo.mBufferKinds.size());
+        totalSize += requestAndBufferInfo.mBufferKinds.size() * su::serializedSize(uint8_t{});
+        return totalSize;
     }
 };
 
@@ -75,6 +115,7 @@ struct ReadySignalInfo
 {
     std::string mAgentName;
     DataContext mContext;
+
     bool mIsReady;
 
     static void serialize(ReadySignalInfo const& readySignalInfo, std::ostream& os)
@@ -218,15 +259,19 @@ public:
         std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager);
     void send(DataContext const& ctx, void const* data, size_t size) const override;
     void recv(DataContext const& ctx, void* data, size_t size) const override;
-    void sendRequestAndBufferInfo(
-        batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx);
-    void setSenderState(
-        MemoryDesc mCacheReceiverBufferDesc, int valideSegmentIdx, std::pair<size_t, size_t> offsetRatio);
-    [[nodiscard]] std::optional<size_t> getCacheBufferId() const;
+    void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
+        std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
+        std::atomic<bool> const* perRequestCancel = nullptr);
+    void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
+        std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
     bool recvReadySignal(DataContext const& ctx) const;
+    std::optional<bool> recvReadySignalWithStatus(DataContext const& ctx) const;
+
+    void activateBuffer(uint8_t kind) const override;
+    [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;
 
 private:
     std::string mAgentName;
@@ -234,17 +279,23 @@ private:
 
     struct SenderState
     {
-        MemoryDesc mCacheReceiverBufferDesc{nullptr, 0, 0};
+        std::vector<MemoryDesc> mCacheReceiverBufferDescs;
         int validSegmentIdx{0};
-        std::pair<size_t, size_t> mOffsetRatio;
+        /// Per-buffer offset ratios. Index corresponds to mCacheReceiverBufferDescs / mActiveBufferIdx.
+        std::vector<std::pair<size_t, size_t>> mOffsetRatios;
+        mutable size_t mActiveBufferIdx{0};
+        [[nodiscard]] MemoryDesc const& activeBufferDesc() const;
+        [[nodiscard]] std::pair<size_t, size_t> const& activeOffsetRatio() const;
+        void setActiveBufferIdx(size_t bufferIdx) const;
         SenderState() = default;
     };
 
     AgentConnectionManager* mAgentConnectionManager;
 
-    batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
-    std::optional<size_t> mCacheBufferId;
-    SenderState mSenderState;
+    std::vector<batch_manager::BaseTransBufferManager*> const& mCacheTransBufferManagers;
+    std::vector<std::optional<size_t>> mCacheBufferIds;
+    std::vector<uint8_t> mBufferKinds;
+    mutable SenderState mSenderState;
     bool mNeedSendMetadata{true};
     bool mHasLoadRemoteAgent{false};
 };
@@ -252,14 +303,17 @@ private:
 class AgentConnectionManager : public ConnectionManager
 {
 public:
-    AgentConnectionManager(
-        batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, CacheState cacheState);
+    AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
+        CacheState cacheState, std::string const& backendType,
+        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
-    AgentConnection const* recvConnectionAndRequestInfo(batch_manager::RequestInfo& requestInfo);
-    [[nodiscard]] batch_manager::kv_cache_manager::CacheTransBufferManager* getCacheTransBufferManager();
+    AgentConnection const* recvConnectionAndRequestInfo(
+        batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
+    [[nodiscard]] std::vector<batch_manager::BaseTransBufferManager*> const& getCacheTransBufferManagers() const;
+    [[nodiscard]] std::vector<uint8_t> const& getBufferKinds() const;
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
     AgentConnection* connect(std::string const& remoteAgentName, std::string const& address,
@@ -268,22 +322,34 @@ public:
     [[nodiscard]] std::string const& getAgentName() const;
 
     template <typename NotificationType>
-    void waitForNotification(std::string const& remoteAgentName, NotificationType& expectedInfo);
-    void waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo& syncInfo);
-    void waitForReadySignal(std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo);
+    bool waitForNotification(
+        std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag);
+    bool waitForSyncInfo(
+        std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag);
+    bool waitForReadySignal(
+        std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
+    [[nodiscard]] bool isRunning() const override;
 
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
+    /// Connection info for dynamically discovered agents that are not listed in mCommState.
+    std::map<std::string, std::string> mRemoteConnectionInfo;
+    std::mutex mRemoteConnectionInfoMutex;
     CommState mCommState;
     CacheState mCacheState;
-    batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
+    std::optional<CacheState::RnnCacheState> mRnnCacheState;
+    std::vector<batch_manager::BaseTransBufferManager*> mCacheTransBufferManagers;
+    std::vector<uint8_t> mBufferKinds;
     std::mutex mNotificationMutex;
     std::unordered_map<std::string, std::list<std::string>> mUnhandledNotifications;
     std::unique_ptr<BaseTransferAgent> m_Agent;
     int mDeviceId;
+    int mRank{0};
+    int mWorldSize{1};
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
+    std::atomic<bool> mIsRunning{true};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

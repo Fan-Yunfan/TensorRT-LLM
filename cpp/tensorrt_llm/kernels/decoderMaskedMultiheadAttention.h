@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -26,8 +27,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -208,6 +209,10 @@ struct Multihead_attention_params_base
     // threadblock counter to identify the complete of partial attention computations
     int* block_counter = nullptr;
 
+    float* cascade_partial_out = nullptr; // [batch_beam x num_heads x head_size]
+    float* cascade_partial_max = nullptr; // [batch_beam x num_heads]
+    float* cascade_partial_sum = nullptr; // [batch_beam x num_heads]
+
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
 };
@@ -294,4 +299,5 @@ inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shm
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

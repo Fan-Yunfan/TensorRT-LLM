@@ -1,5 +1,7 @@
+import os
 import pickle
 import sys
+from contextlib import contextmanager
 from itertools import product
 from typing import Dict, List, Optional
 from unittest import mock
@@ -9,14 +11,16 @@ import cloudpickle
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.util import (check_accuracy, skip_neither_ada_nor_hopper_unittest,
-                        skip_non_hopper_unittest, skip_pre_blackwell,
-                        skip_pre_hopper)
+from transformers.configuration_utils import PretrainedConfig
+from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
+                        skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -24,9 +28,8 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
     CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
     DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
-    AlltoallMethodType
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    AlltoallMethodType, MoEWeightLoadingMode)
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
@@ -34,13 +37,17 @@ from tensorrt_llm._torch.modules.fused_moe import (
     BaseMoeRoutingMethod, CutlassFusedMoE, TRTLLMGenFusedMoE,
     DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod, TritonFusedMoE,
     create_moe, WideEPMoE)
+from tensorrt_llm._torch.modules.fused_moe.quantization import \
+    NVFP4CutlassFusedMoEMethod
 # isort: on
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+# NOTE: Most tests in this file are deprecated and skipped. They are now covered by the
+# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# and test_moe_module.py. Add new MoE tests there instead of here.
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 cloudpickle.register_pickle_by_value(_torch.helpers)
@@ -51,6 +58,32 @@ MPI.pickle.__init__(
 )
 
 
+@contextmanager
+def moe_trtllm_debug_msg(enable=False):
+    TLLM_BATCHED_GEMM_PRINT_NAME = os.environ.get(
+        "TLLM_BATCHED_GEMM_PRINT_NAME", "0")
+    TLLM_BATCHED_GEMM_PRINT_CONFIGS = os.environ.get(
+        "TLLM_BATCHED_GEMM_PRINT_CONFIGS", "0")
+    if enable:
+        os.environ["TLLM_BATCHED_GEMM_PRINT_NAME"] = "1"
+        os.environ["TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = "1"
+    try:
+        yield
+    finally:
+        os.environ[
+            "TLLM_BATCHED_GEMM_PRINT_NAME"] = TLLM_BATCHED_GEMM_PRINT_NAME
+        os.environ[
+            "TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = TLLM_BATCHED_GEMM_PRINT_CONFIGS
+
+
+def round_up(x, alignment):
+    return (x + alignment - 1) // alignment * alignment
+
+
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.parametrize(
     "moe_backend, dtype, experts, routing_cls, bias",
     product(["CUTLASS", "VANILLA", "TRITON"], [torch.float16, torch.bfloat16],
@@ -64,8 +97,8 @@ def test_fused_moe(moe_backend,
                    mapping=None):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
+        if get_sm_version() != 90:
+            pytest.skip("TRITON moe backend is only supported on Hopper")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -76,6 +109,7 @@ def test_fused_moe(moe_backend,
 
     mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
+    AutoTuner.get().setup_distributed_state(mapping)
 
     torch.cuda.set_device(mapping.rank)
 
@@ -115,14 +149,20 @@ def test_fused_moe(moe_backend,
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         fused_moe = create_moe(
-            num_experts=NUM_EXPERTS,
             routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
             reduce_results=True,
-            model_config=ModelConfig(mapping=mapping, moe_backend=moe_backend),
+            model_config=ModelConfig(pretrained_config=pretrained_config,
+                                     mapping=mapping,
+                                     moe_backend=moe_backend),
             bias=bias,
         )
         fused_moe.load_weights([weights])
@@ -157,12 +197,16 @@ def test_fused_moe(moe_backend,
         # Evaluate outputs
         torch.cuda.synchronize()
         # There can be one off mismatch in the outputs due to different kernel implementations
-        # Here we check 99% of the outputs are within the tolerance
+        # Here we check most of the outputs are within the tolerance
         # The CutlassFusedMoE case fails as well without this change on H100 for bf16
-        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.984)
+        check_accuracy(output, ref_output, rtol=0.2, atol=0.2, percent=0.975)
         m //= 2
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("moe_cls", ["CUTLASS", "VANILLA"])
@@ -183,10 +227,14 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.MNNVL, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
     AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
@@ -213,11 +261,14 @@ def test_fused_moe_alltoall(alltoall_method_type):
         weights = {}
         for expert_id in range(NUM_EXPERTS):
             w1_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w2_weight = torch.empty((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             w3_weight = torch.empty((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype)
+                                    dtype=dtype,
+                                    device="cuda")
             torch.nn.init.xavier_uniform_(w1_weight)
             torch.nn.init.xavier_uniform_(w2_weight)
             torch.nn.init.xavier_uniform_(w3_weight)
@@ -275,7 +326,7 @@ def test_fused_moe_alltoall(alltoall_method_type):
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False)
 
-            if alltoall_method_type == AlltoallMethodType.MNNVL and output.ndim == 3:
+            if output.ndim == 3:
                 output = output.sum(dim=1)
             print(f"output: {output.shape}")
             print(f"ref_output: {ref_output.shape}")
@@ -293,19 +344,21 @@ def test_fused_moe_alltoall(alltoall_method_type):
             assert r is None
 
 
-@pytest.mark.skip(reason="https://nvbugs/5467531")
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.MNNVL, AlltoallMethodType.DeepEP,
+    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
     AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
 def test_fused_moe_alltoall_fp4(alltoall_method_type):
-
     world_size = 4
     dtype = torch.bfloat16
-    HIDDEN_SIZE = 2560
+    HIDDEN_SIZE = 4096
     INTERMEDIATE_SIZE = 1536
     NUM_EXPERTS = 72
     TOP_K = 6
@@ -321,8 +374,8 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
         x_list = []
         m = MAX_NUM_TOKENS
         while m >= 1:
-            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype, device="cuda")
-            x_list.append(x.cuda(i))
+            x = torch.randn((m, HIDDEN_SIZE), dtype=dtype)
+            x_list.append(x)
             m //= 2
 
         x_abs_max = torch.cat([x.flatten() for x in x_list]).abs().max().float()
@@ -367,40 +420,28 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
                 w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
 
-            w1_input_scale = x_sf_global.cuda(i)
-            w2_input_scale = x_sf_global.cuda(i)
-            w3_input_scale = x_sf_global.cuda(i)
+            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4.cpu()
+            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4.cpu()
+            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4.cpu()
+            weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled
+            weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled
+            weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled
 
-            weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4.cuda(i)
-            weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4.cuda(i)
-            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4.cuda(i)
-            weights[
-                f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.cuda(i)
-            weights[
-                f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.cuda(i)
-            weights[
-                f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.cuda(i)
-
-            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale.cuda(
-                i)
-            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale.cuda(
-                i)
-            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale.cuda(
-                i)
-            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global.cuda(
-                i)
-            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global.cuda(
-                i)
-            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global.cuda(
-                i)
+            weights[f"{expert_id}.w1.input_scale"] = 1.0 / x_sf_global
+            weights[f"{expert_id}.w2.input_scale"] = 1.0 / x_sf_global
+            weights[f"{expert_id}.w3.input_scale"] = 1.0 / x_sf_global
+            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global.cpu()
+            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global.cpu()
+            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global.cpu()
 
         x_list_world.append(x_list)
         weights_world.append(weights)
+        torch.cuda.synchronize()
 
-    def per_rank_test_fused_moe_alltoall(job_id):
+    def per_rank_test_fused_moe_alltoall(job_id, weights, x_list):
         routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
         mapping = Mapping(world_size=world_size,
-                          rank=mpi_rank(),
+                          rank=job_id,
                           tp_size=world_size,
                           moe_ep_size=world_size,
                           moe_tp_size=1,
@@ -408,8 +449,8 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
         torch.cuda.set_device(mapping.rank)
         torch.manual_seed(mapping.rank)
 
-        x_list = x_list_world[mapping.rank]
-        weights = weights_world[mapping.rank]
+        weights = {k: v.cuda() for k, v in weights.items()}
+        x_list = [x.cuda() for x in x_list]
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
         with mock.patch.object(WideEPMoE,
@@ -460,6 +501,16 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
                     use_dp_padding=False)
+                # Verify the fake impl is correct.
+                output_fake = alltoall_model.forward_fake(
+                    x,
+                    router_logits,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=False)
+                assert output_fake.shape == output.shape
+                assert output_fake.dtype == output.dtype
+                if len(output.shape) == 3:
+                    output = torch.sum(output, dim=1, keepdim=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
@@ -471,14 +522,22 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             m //= 2
 
     with MPIPoolExecutor(max_workers=world_size) as executor:
-        results = executor.map(per_rank_test_fused_moe_alltoall,
-                               range(world_size))
+        results = executor.map(
+            per_rank_test_fused_moe_alltoall,
+            *zip(*[(i, weights_world[i], x_list_world[i])
+                   for i in range(world_size)]))
         for r in results:
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_hopper
-@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    ["CUTLASS", pytest.param("TRITON", marks=skip_no_hopper)])
 @pytest.mark.parametrize("routing_cls",
                          [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
 @pytest.mark.parametrize("bias", [True, False])
@@ -486,8 +545,6 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
 def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
 
     if moe_backend == "TRITON":
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -560,23 +617,23 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             weights[f"{expert_id}.w2.input_scale"] = w2_input_scale
             weights[f"{expert_id}.w3.input_scale"] = w3_input_scale
 
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-        fused_moe = create_moe(num_experts=NUM_EXPERTS,
-                               routing_method=routing_method,
-                               hidden_size=HIDDEN_SIZE,
-                               intermediate_size=INTERMEDIATE_SIZE,
-                               dtype=dtype,
+        fused_moe = create_moe(routing_method=routing_method,
                                reduce_results=False,
                                model_config=ModelConfig(
+                                   pretrained_config=pretrained_config,
                                    quant_config=quant_config,
                                    moe_backend=moe_backend),
                                bias=bias)
         fused_moe.cuda()
         fused_moe.load_weights([weights])
-
-        AutoTuner.get().clear_cache()
-        with torch.inference_mode(), autotune():
-            fused_moe.forward(x, router_logits)
 
         ref_fused_moe = RefGatedMLPFusedMoE(
             num_experts=NUM_EXPERTS,
@@ -588,13 +645,38 @@ def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
             bias=bias)
         ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
+
+        AutoTuner.get().clear_cache()
         with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
             ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        check_accuracy(output, ref_output, rtol=0.04, atol=0.1, percent=0.99)
+        with torch.inference_mode(), autotune():
+            fused_moe.forward(x, router_logits)
+
+        # TRITON backend uses Triton kernels which don't register with AutoTuner
+        if moe_backend == "TRITON":
+            with torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+            check_accuracy(output,
+                           ref_output,
+                           rtol=0.04,
+                           atol=0.1,
+                           percent=0.99)
+        else:
+            # Explicitly capture context for kernel testing
+            with AutoTuner.get().capture() as all_tactics, torch.inference_mode(
+            ):
+                output = fused_moe.forward(x, router_logits)
+
+            # Test all kernel tactics
+            for tactic in all_tactics:
+                with AutoTuner.get().replay(tactic), torch.inference_mode():
+                    output = fused_moe.forward(x, router_logits)
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=0.04,
+                                   atol=0.1,
+                                   percent=0.99)
 
 
 def set_tensor_value_2(x, num_row, num_cols):
@@ -640,13 +722,16 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
-@pytest.mark.skip(reason="https://nvbugs/5550283")
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize(
     "alltoall_method_type",
-    [AlltoallMethodType.MNNVL, AlltoallMethodType.NotEnabled],
+    [AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.NotEnabled],
     ids=lambda s: s.name)
 def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
     """Test WideEPMoE with FP8 block-wise quantization using DeepGemmFusedMoE as reference."""
@@ -742,6 +827,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             )
         alltoall_model.to("cuda")
         alltoall_model.load_weights([weights])
+        alltoall_model.post_load_weights()
 
         # Use DeepGemmFusedMoE as reference
         ref_model = DeepGemmFusedMoE(
@@ -757,6 +843,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
         )
         ref_model.to("cuda")
         ref_model.load_weights([weights])
+        ref_model.post_load_weights()
 
         # Evaluate the outputs on variant sequence lengths
         m = MAX_NUM_TOKENS
@@ -773,13 +860,11 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
                 ref_output = ref_model.forward(
                     x,
                     router_logits,
                     all_rank_num_tokens=all_rank_num_tokens,
-                    all_rank_max_num_tokens=m,
                     use_dp_padding=False)
 
             # Evaluate outputs with relaxed tolerance for FP8
@@ -796,6 +881,10 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
@@ -813,6 +902,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
                                           hidden_size,
                                           RoutingMethodCls,
                                           mapping=None):
+
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
     INTERMEDIATE_SIZE = 256
@@ -876,14 +966,20 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
-    fused_moe = DeepGemmFusedMoE(
-        num_experts=NUM_EXPERTS,
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+    pretrained_config.torch_dtype = dtype
+
+    fused_moe = create_moe(
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
+                                 mapping=mapping,
+                                 moe_backend="DEEPGEMM"),
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
@@ -974,6 +1070,10 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
@@ -1108,7 +1208,11 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
+@skip_no_hopper
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1190,7 +1294,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
 
         if WeightLoadingMode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
             weights['gate_up_proj'][expert_id] = torch.cat(
-                [w3_weight_fp8, w1_weight_fp8],
+                [w1_weight_fp8, w3_weight_fp8],
                 dim=-2).transpose(0, 1).contiguous()
             weights['down_proj'][expert_id] = w2_weight_fp8.transpose(
                 0, 1).contiguous()
@@ -1218,6 +1322,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
+    fused_moe.post_load_weights()
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
@@ -1227,8 +1332,9 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
     )
-    ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
+    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.post_load_weights()
 
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
@@ -1240,7 +1346,11 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     return True
 
 
-@skip_non_hopper_unittest
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
+@skip_no_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -1273,6 +1383,10 @@ def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -1306,21 +1420,94 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe_nvfp4(dtype):
+@pytest.mark.parametrize("moe_backend", [
+    pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS", "CUTEDSL"
+])
+@pytest.mark.parametrize(
+    "finalize_fusion", [True, False],
+    ids=["enable_finalize_fusion", "disable_finalize_fusion"])
+def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion):
+
+    run_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion)
+
+
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
+@skip_pre_blackwell
+@pytest.mark.parametrize("hidden_size, intermediate_size", [(2880, 2880)])
+@pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
+@pytest.mark.parametrize("swiglu_beta", [0, 1], ids=lambda v: f"beta{v}")
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 1],
+                         ids=lambda v: f"limit{v}")
+def test_fused_moe_nvfp4_gptoss_style(hidden_size, intermediate_size,
+                                      swiglu_alpha, swiglu_beta, swiglu_limit):
+    run_fused_moe_nvfp4(dtype=torch.bfloat16,
+                        moe_backend="TRTLLM",
+                        finalize_fusion=False,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=32,
+                        top_k=4,
+                        seq_len=256,
+                        gptoss_style=True,
+                        swiglu_alpha=swiglu_alpha,
+                        swiglu_beta=swiglu_beta,
+                        swiglu_limit=swiglu_limit)
+
+
+def run_fused_moe_nvfp4(dtype,
+                        moe_backend,
+                        finalize_fusion,
+                        hidden_size=512,
+                        intermediate_size=512,
+                        num_experts=8,
+                        top_k=2,
+                        seq_len=4,
+                        gptoss_style=False,
+                        swiglu_alpha=None,
+                        swiglu_beta=None,
+                        swiglu_limit=None):
+
+    if moe_backend == "TRTLLM":
+        if dtype == torch.float16:
+            pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+        if finalize_fusion:
+            pytest.skip(
+                "TRTLLM NVFP4 MoE backend does not support fused finalize yet")
+    if moe_backend == "CUTEDSL":
+        if dtype == torch.float16:
+            pytest.skip(
+                "CUTEDSL NVFP4 MoE backend does not support float16 yet")
+        if get_sm_version() not in (100, 103):
+            pytest.skip(
+                "CUTEDSL NVFP4 MoE backend supports SM 100 (B200) and SM 103 (B300) only"
+            )
+
+    test_all_kernels = True
+    if get_sm_version() == 120:
+        # Disable; got "Assertion failed: Failed to initialize cutlass TMA WS grouped gemm. Error: Error Internal"
+        test_all_kernels = False
+
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
-    with torch.device(f'cuda:{mapping.rank}'):
+    with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
 
-        SEQ_LEN = 4
-        HIDDEN_SIZE = 128
-        INTERMEDIATE_SIZE = 128
-        NUM_EXPERTS = 3
-        TOP_K = 2
-        routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
+        SEQ_LEN = seq_len
+        HIDDEN_SIZE = hidden_size
+        INTERMEDIATE_SIZE = intermediate_size
+        NUM_EXPERTS = num_experts
+        TOP_K = top_k
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
         x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
@@ -1331,39 +1518,53 @@ def test_fused_moe_nvfp4(dtype):
 
         weights = {}
         for expert_id in range(NUM_EXPERTS):
-            w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w1_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
-            w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w2_weight = torch.randn(
+                (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
 
-            w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w3_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
+
+            if gptoss_style:
+                w1_bias = torch.randn(INTERMEDIATE_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                w2_bias = torch.randn(HIDDEN_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                w3_bias = torch.randn(INTERMEDIATE_SIZE,
+                                      device='cuda',
+                                      dtype=torch.float)
+                weights[f"{expert_id}.w1.bias"] = w1_bias
+                weights[f"{expert_id}.w2.bias"] = w2_bias
+                weights[f"{expert_id}.w3.bias"] = w3_bias
 
             w3_w1_global = min(
                 w1_sf_global,
                 w3_sf_global)  # w3 global and w1 global must be the same
 
-            w1_weight_nvfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
-                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w1_weight_nvfp4, w1_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w1_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w1_sf_block_unswizzled = w1_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
-            w2_weight_nvfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
-                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False)
-            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
+            w2_weight_nvfp4, w2_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w2_weight, w2_sf_global, SCALING_VECTOR_SIZE, False, False)
+            w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(
+                HIDDEN_SIZE, -1)
 
-            w3_weight_nvfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
-                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False)
-            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
+            w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                w3_weight, w3_w1_global, SCALING_VECTOR_SIZE, False, False)
+            w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(
+                INTERMEDIATE_SIZE, -1)
 
             w1_input_scale = x_sf_global.cuda()
             w2_input_scale = x_sf_global.cuda()
@@ -1388,17 +1589,48 @@ def test_fused_moe_nvfp4(dtype):
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
+        swiglu_alpha_tensor = None
+        swiglu_beta_tensor = None
+        swiglu_limit_tensor = None
+        if gptoss_style:
+            swiglu_alpha_tensor = torch.full((NUM_EXPERTS, ),
+                                             swiglu_alpha,
+                                             device='cuda',
+                                             dtype=torch.float)
+            swiglu_beta_tensor = torch.full((NUM_EXPERTS, ),
+                                            swiglu_beta,
+                                            device='cuda',
+                                            dtype=torch.float)
+            swiglu_limit_tensor = torch.full((NUM_EXPERTS, ),
+                                             swiglu_limit,
+                                             device='cuda',
+                                             dtype=torch.float)
+
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-        fused_moe = CutlassFusedMoE(
-            num_experts=NUM_EXPERTS,
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
+        fused_moe = create_moe(
             routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
-        fused_moe.load_weights([weights])
+            reduce_results=True,
+            model_config=ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                moe_backend=moe_backend,
+                moe_disable_finalize_fusion=not finalize_fusion),
+            bias=gptoss_style,
+            swiglu_alpha=swiglu_alpha_tensor,
+            swiglu_beta=swiglu_beta_tensor,
+            swiglu_limit=swiglu_limit_tensor,
+        )
         fused_moe.cuda()
+        fused_moe.load_weights([weights])
+        fused_moe.post_load_weights()
 
         # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
         ref_fused_moe = RefGatedMLPFusedMoE(
@@ -1407,25 +1639,82 @@ def test_fused_moe_nvfp4(dtype):
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
             dtype=dtype,
-            model_config=ModelConfig(quant_config=quant_config))
-        ref_fused_moe.load_weights([weights])
+            model_config=ModelConfig(quant_config=quant_config),
+            bias=gptoss_style,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit)
         ref_fused_moe.cuda()
+        ref_fused_moe.load_weights([weights])
 
         AutoTuner.get().clear_cache()
-        with torch.inference_mode(), autotune():
-            fused_moe.forward(x, router_logits)
-
         with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
             ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+        if not gptoss_style:
+            with torch.inference_mode(), autotune():
+                fused_moe.forward(x, router_logits)
+        else:
+            # We skip autotune for gptoss style to reduce memory usage since the input shape is already quite large.
+            with torch.inference_mode():
+                fused_moe.forward(x, router_logits)
+
+        output = fused_moe.forward(x, router_logits)
+
+        if gptoss_style:
+            rtol = 0.1
+            atol = 0.1
+            percent = 0.95
+        else:
+            rtol = 1e-2
+            atol = 0.15
+            percent = None
+
+        if gptoss_style:
+            check_accuracy(output,
+                           ref_output,
+                           rtol=rtol,
+                           atol=atol,
+                           percent=percent)
+        else:
+            torch.testing.assert_close(output, ref_output, rtol=rtol, atol=atol)
+
+        if not test_all_kernels:
+            return
+
+        # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
+        if getattr(fused_moe, 'use_flashinfer', False):
+            return
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                if gptoss_style:
+                    check_accuracy(output,
+                                   ref_output,
+                                   rtol=rtol,
+                                   atol=atol,
+                                   percent=percent)
+                else:
+                    torch.testing.assert_close(output,
+                                               ref_output,
+                                               rtol=rtol,
+                                               atol=atol)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
-def test_fused_moe_w4a8_nvfp4_fp8():
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
     dtype = torch.bfloat16
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1514,14 +1803,15 @@ def test_fused_moe_w4a8_nvfp4_fp8():
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_NVFP4_FP8)
-        fused_moe = TRTLLMGenFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe = TRTLLMGenFusedMoE(num_experts=NUM_EXPERTS,
+                                      routing_method=routing_method,
+                                      hidden_size=HIDDEN_SIZE,
+                                      intermediate_size=INTERMEDIATE_SIZE,
+                                      dtype=dtype,
+                                      reduce_results=False,
+                                      model_config=ModelConfig(
+                                          quant_config=quant_config,
+                                          moe_backend=moe_backend))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -1537,18 +1827,30 @@ def test_fused_moe_w4a8_nvfp4_fp8():
         ref_fused_moe.cuda()
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref_fused_moe.forward(x, router_logits)
 
-        # compare
-        torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-1, atol=0.5)
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-1,
+                                           atol=0.5)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_neither_ada_nor_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -1612,15 +1914,14 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                                       dtype=torch.int8).cuda()
 
             # The pre-quant scale to be multiplied with the input activation.
-            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
-            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE,
-                                            dtype=dtype,
-                                            device="cuda")
+            # Use random pre-quant scales [0.95, 1.05] instead of fixed 1.0 to ensure the kernel handles
+            # non-uniform pre-quant scaling factors correctly
+            w1_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w2_pre_quant_scale = torch.rand(
+                INTERMEDIATE_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
+            w3_pre_quant_scale = torch.rand(
+                HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.1 + 0.95
 
             # The weight scale to dequantize int4 weights (by multiplication).
             w1_scale = torch.randn(
@@ -1794,129 +2095,310 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                # assert that result does not contain NaN or is all 0s
+                assert not torch.isnan(output).any(), "output contains NaN"
+                assert torch.nonzero(output).numel() > 0, "output is empty"
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-2,
+                                           atol=0.1)
 
         torch.cuda.synchronize()
-        # assert that result does not contain NaN or is all 0s
         assert not torch.isnan(ref_output).any(), "ref_output contains NaN"
         assert not torch.isnan(output).any(), "output contains NaN"
         assert torch.nonzero(output).numel() > 0, "output is empty"
         assert torch.nonzero(ref_output).numel() > 0, "ref_output is empty"
-        # compare
+        # Final comparison
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
-@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
+@pytest.mark.parametrize(
+    "moe_backend",
+    [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
+@pytest.mark.parametrize("hidden_unpadded", [64, 192, 256])
+@pytest.mark.parametrize("seq_len", [8, 128])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
+def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
-    SEQ_LEN = 128
-    HIDDEN_SIZE = 256
-    INTERMEDIATE_SIZE = 256
+    SEQ_LEN = seq_len
+    HIDDEN_SIZE_UNPADDED = hidden_unpadded
+    INTERMEDIATE_SIZE_UNPADDED = hidden_unpadded
     NUM_EXPERTS = 8
-    TOP_K = 1
+    TOP_K = 4
     routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda() * 0.1
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
 
-    weights = {}
-    for expert_id in range(NUM_EXPERTS):
-        if bias:
-            w1_bias = torch.randn(
-                (INTERMEDIATE_SIZE, ), dtype=dtype).cuda() * 0.1
-            w2_bias = torch.randn((HIDDEN_SIZE, ), dtype=dtype).cuda() * 0.1
-            w3_bias = torch.randn(
-                (INTERMEDIATE_SIZE, ), dtype=dtype).cuda() * 0.1
-            weights[f"{expert_id}.w1.bias"] = w1_bias
-            weights[f"{expert_id}.w2.bias"] = w2_bias
-            weights[f"{expert_id}.w3.bias"] = w3_bias
-        w1_weight = torch.randn(
-            (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() * 0.1
-        w2_weight = torch.randn(
-            (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype).cuda() * 0.1
-        w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                dtype=dtype).cuda()
-
-        w1_weight_mxfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
-            w1_weight, None, SCALING_VECTOR_SIZE, True)
-        w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            w1_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
-
-        w2_weight_mxfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
-            w2_weight, None, SCALING_VECTOR_SIZE, True)
-        w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            w2_sf_block.cpu().view(HIDDEN_SIZE, -1))
-
-        w3_weight_mxfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
-            w3_weight, None, SCALING_VECTOR_SIZE, True)
-        w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-            w3_sf_block.cpu().view(INTERMEDIATE_SIZE, -1))
-
-        weights[f"{expert_id}.w1.weight"] = w1_weight_mxfp4
-        weights[f"{expert_id}.w2.weight"] = w2_weight_mxfp4
-        weights[f"{expert_id}.w3.weight"] = w3_weight_mxfp4
-        weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
-            torch.uint8).cuda()
-        weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
-            torch.uint8).cuda()
-        weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
-            torch.uint8).cuda()
-
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+
+    # Create pretrained_config with necessary parameters
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = NUM_EXPERTS
+    pretrained_config.hidden_size = HIDDEN_SIZE_UNPADDED
+    pretrained_config.intermediate_size = INTERMEDIATE_SIZE_UNPADDED
+    pretrained_config.torch_dtype = dtype
+
     fused_moe = create_moe(
-        num_experts=NUM_EXPERTS,
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
         reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config,
+        model_config=ModelConfig(pretrained_config=pretrained_config,
+                                 quant_config=quant_config,
                                  moe_backend=moe_backend),
         bias=bias,
     )
     fused_moe.cuda()
-    fused_moe.load_weights([weights])
+    fused_moe.create_weights()
 
-    # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
+    num_elts_per_dtype = torch.iinfo(
+        fused_moe.quant_method.weight_dtype).bits // 4
+
+    HIDDEN_SIZE_IN = fused_moe.w3_w1_weight.shape[
+        -1] * num_elts_per_dtype  # last dim packed type factor
+    HIDDEN_SIZE_OUT = fused_moe.w2_weight.shape[-2]
+    INTERMEDIATE_SIZE = fused_moe.w2_weight.shape[
+        -1] * num_elts_per_dtype  # last dim packed type factor
+
+    def dist_to_alignment(size, alignment):
+        return round_up(size, alignment) - size
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE_UNPADDED), dtype=dtype).cuda() * 0.1
+    x = torch.nn.functional.pad(
+        x, (0, dist_to_alignment(HIDDEN_SIZE_UNPADDED, HIDDEN_SIZE_IN)))
+
+    def prepare_weights(num_experts: int,
+                        hidden_size_in: int,
+                        hidden_size_out: int,
+                        intermediate_size: int,
+                        bias: bool,
+                        hidden_size_unpadded: int,
+                        intermediate_size_unpadded: int,
+                        pad_zero_or_val: bool,
+                        weight_alignment: int = 128,
+                        input_hidden_alignment: int = 512):
+        # Ensures each call gives same outcome
+        torch.manual_seed(42)
+        # Contamination value
+        contam_val = 42
+        intermediate_size_unpadded = intermediate_size_unpadded or intermediate_size
+        weights = {}
+        for expert_id in range(num_experts):
+            if bias:
+                w1_bias = torch.randn(
+                    (intermediate_size_unpadded, ), dtype=dtype).cuda() * 0.1
+                w2_bias = torch.randn(
+                    (hidden_size_unpadded, ), dtype=dtype).cuda() * 0.1
+                w3_bias = torch.randn(
+                    (intermediate_size_unpadded, ), dtype=dtype).cuda() * 0.1
+                # Pad to output dimension using contamination
+                w1_bias = torch.nn.functional.pad(
+                    w1_bias,
+                    (0, dist_to_alignment(w1_bias.shape[-1],
+                                          intermediate_size)), "constant",
+                    0 if pad_zero_or_val else contam_val)
+                w2_bias = torch.nn.functional.pad(
+                    w2_bias,
+                    (0, dist_to_alignment(hidden_size_unpadded,
+                                          hidden_size_out)), "constant",
+                    0 if pad_zero_or_val else contam_val)
+                w3_bias = torch.nn.functional.pad(
+                    w3_bias,
+                    (0, dist_to_alignment(w3_bias.shape[-1],
+                                          intermediate_size)), "constant",
+                    0 if pad_zero_or_val else contam_val)
+                weights[f"{expert_id}.w1.bias"] = w1_bias
+                weights[f"{expert_id}.w2.bias"] = w2_bias
+                weights[f"{expert_id}.w3.bias"] = w3_bias
+
+            w1_weight = torch.randn(
+                (intermediate_size_unpadded, hidden_size_unpadded),
+                dtype=dtype).cuda() * 0.1
+            w2_weight = torch.randn(
+                (hidden_size_unpadded, intermediate_size_unpadded),
+                dtype=dtype).cuda() * 0.1
+            w3_weight = torch.randn(
+                (intermediate_size_unpadded, hidden_size_unpadded),
+                dtype=dtype).cuda()
+            # First padding step: pad weight tensors from unpadded dimensions to weight-aligned dimensions using 0s
+            w1_weight = torch.nn.functional.pad(
+                w1_weight, (0,
+                            dist_to_alignment(hidden_size_unpadded,
+                                              input_hidden_alignment), 0,
+                            dist_to_alignment(intermediate_size_unpadded,
+                                              weight_alignment)))
+            w2_weight = torch.nn.functional.pad(
+                w2_weight, (0,
+                            dist_to_alignment(intermediate_size_unpadded,
+                                              weight_alignment)))
+            w3_weight = torch.nn.functional.pad(
+                w3_weight, (0,
+                            dist_to_alignment(hidden_size_unpadded,
+                                              input_hidden_alignment), 0,
+                            dist_to_alignment(intermediate_size_unpadded,
+                                              weight_alignment)))
+            # Second padding step: pad from aligned dimensions to final dimensions using contamination
+            w1_weight = torch.nn.functional.pad(
+                w1_weight,
+                (0, dist_to_alignment(w1_weight.shape[-1], hidden_size_in), 0,
+                 dist_to_alignment(w1_weight.shape[-2], intermediate_size)),
+                "constant", 0 if pad_zero_or_val else contam_val)
+            w2_weight = torch.nn.functional.pad(
+                w2_weight,
+                (0, dist_to_alignment(w2_weight.shape[-1], intermediate_size),
+                 0, dist_to_alignment(w2_weight.shape[-2], hidden_size_out)),
+                "constant", 0 if pad_zero_or_val else contam_val)
+            w3_weight = torch.nn.functional.pad(
+                w3_weight,
+                (0, dist_to_alignment(w3_weight.shape[-1], hidden_size_in), 0,
+                 dist_to_alignment(w3_weight.shape[-2], intermediate_size)),
+                "constant", 0 if pad_zero_or_val else contam_val)
+
+            w1_weight_mxfp4, w1_sf_block = torch.ops.trtllm.fp4_quantize(
+                w1_weight, None, SCALING_VECTOR_SIZE, True)
+            w1_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w1_sf_block.cpu().view(intermediate_size, -1))
+
+            w2_weight_mxfp4, w2_sf_block = torch.ops.trtllm.fp4_quantize(
+                w2_weight, None, SCALING_VECTOR_SIZE, True)
+            w2_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w2_sf_block.cpu().view(hidden_size_out, -1))
+
+            w3_weight_mxfp4, w3_sf_block = torch.ops.trtllm.fp4_quantize(
+                w3_weight, None, SCALING_VECTOR_SIZE, True)
+            w3_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                w3_sf_block.cpu().view(intermediate_size, -1))
+
+            weights[f"{expert_id}.w1.weight"] = w1_weight_mxfp4
+            weights[f"{expert_id}.w2.weight"] = w2_weight_mxfp4
+            weights[f"{expert_id}.w3.weight"] = w3_weight_mxfp4
+            weights[
+                f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
+                    torch.uint8).cuda()
+            weights[
+                f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
+                    torch.uint8).cuda()
+            weights[
+                f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
+                    torch.uint8).cuda()
+        return weights
+
+    weights_pad_unsanitized = prepare_weights(
+        NUM_EXPERTS,
+        HIDDEN_SIZE_IN,
+        HIDDEN_SIZE_OUT,
+        INTERMEDIATE_SIZE,
+        bias,
+        HIDDEN_SIZE_UNPADDED,
+        INTERMEDIATE_SIZE_UNPADDED,
+        pad_zero_or_val=False,
+        weight_alignment=fused_moe.quant_method.weight_alignment,
+        input_hidden_alignment=getattr(fused_moe.quant_method,
+                                       "input_hidden_alignment",
+                                       fused_moe.quant_method.weight_alignment),
+    )
+    fused_moe.cuda()
+    fused_moe.load_weights([weights_pad_unsanitized])
+    fused_moe.post_load_weights()
+
+    if moe_backend == "TRTLLM":
+        # Check sizes match. Note shape[-1] is in number of uint8 elements each containing 2x mxfp4 elements.
+        assert (fused_moe.quant_method.intermediate_size_per_partition_lean ==
+                INTERMEDIATE_SIZE_UNPADDED)
+        assert fused_moe.w2_weight.shape[-1] * num_elts_per_dtype == round_up(
+            INTERMEDIATE_SIZE, fused_moe.quant_method.weight_alignment)
+        assert fused_moe.w3_w1_weight.shape[-1] * num_elts_per_dtype == round_up(
+            HIDDEN_SIZE_IN, fused_moe.quant_method.input_hidden_alignment)
+
+    weights_pad_sanitized = prepare_weights(
+        NUM_EXPERTS,
+        HIDDEN_SIZE_IN,
+        HIDDEN_SIZE_IN,
+        INTERMEDIATE_SIZE,
+        bias,
+        HIDDEN_SIZE_UNPADDED,
+        INTERMEDIATE_SIZE_UNPADDED,
+        pad_zero_or_val=True,
+        weight_alignment=fused_moe.quant_method.weight_alignment,
+        input_hidden_alignment=fused_moe.quant_method.weight_alignment,
+    )
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
+        hidden_size=HIDDEN_SIZE_IN,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         bias=bias,
-        model_config=ModelConfig(quant_config=quant_config))
+        model_config=ModelConfig(quant_config=quant_config),
+    )
     ref_fused_moe.cuda()
-    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.load_weights([weights_pad_sanitized])
 
     AutoTuner.get().clear_cache()
+    with torch.inference_mode():
+        ref_output = ref_fused_moe.forward(x,
+                                           router_logits)[:, :HIDDEN_SIZE_OUT]
+
     with torch.inference_mode(), autotune():
         fused_moe.forward(x, router_logits)
 
-    with torch.inference_mode():
+    # Capture fused_moe underlying runners as autotuner context
+    with AutoTuner.get().capture() as all_tactics, torch.inference_mode(
+    ), moe_trtllm_debug_msg(enable=False):
         output = fused_moe.forward(x, router_logits)
-        ref_output = ref_fused_moe.forward(x, router_logits)
+        output = torch.nn.functional.pad(
+            output, (0, HIDDEN_SIZE_OUT - HIDDEN_SIZE_UNPADDED))
+        assert not torch.isnan(output).any(), "output contains NaN"
+        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
-    # compare
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
+    for i, tactic in enumerate(all_tactics):
+        with AutoTuner.get().replay(tactic), torch.inference_mode(
+        ), moe_trtllm_debug_msg(enable=False):
+            output = fused_moe.forward(x, router_logits)
+            output = torch.nn.functional.pad(
+                output, (0, HIDDEN_SIZE_OUT - HIDDEN_SIZE_UNPADDED))
+            assert not torch.isnan(output).any(
+            ), f"tactic {tactic} at index {i} output contains NaN"
+            torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
-@skip_non_hopper_unittest
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [768, 2880])
-def test_fused_moe_wfp4a16(dtype, hidden_size):
-
+@pytest.mark.parametrize(
+    "moe_backend",
+    [
+        # smVersion
+        pytest.param("TRTLLM",
+                     marks=[skip_blackwell_geforce, skip_pre_blackwell]),
+        pytest.param(
+            "CUTLASS",
+            marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
+    ],
+)
+def test_fused_moe_wfp4a16(dtype, hidden_size, moe_backend):
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
@@ -1925,7 +2407,7 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
         HIDDEN_SIZE = hidden_size
         INTERMEDIATE_SIZE = 640
         SCALING_GROUP_SIZE = 32
-        NUM_EXPERTS = 3
+        NUM_EXPERTS = 4
         TOP_K = 2
         routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
@@ -1970,19 +2452,30 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
             weights[f"{expert_id}.w1.weight"] = w1_weight
             weights[f"{expert_id}.w2.weight"] = w2_weight
             weights[f"{expert_id}.w3.weight"] = w3_weight
+            # WFP4A16FusedMoEMethod
             weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
             weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
             weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+            # MXFP4WeightFusedMoEMethod
+            weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
-        fused_moe = CutlassFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+
+        # Create pretrained_config with necessary parameters
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = NUM_EXPERTS
+        pretrained_config.hidden_size = HIDDEN_SIZE
+        pretrained_config.intermediate_size = INTERMEDIATE_SIZE
+        pretrained_config.torch_dtype = dtype
+
+        fused_moe = create_moe(routing_method=routing_method,
+                               reduce_results=False,
+                               model_config=ModelConfig(
+                                   pretrained_config=pretrained_config,
+                                   quant_config=quant_config,
+                                   moe_backend=moe_backend))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -2025,20 +2518,32 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
+
+        # Test all kernel tactics
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                check_accuracy(output,
+                               ref_output,
+                               rtol=1e-2,
+                               atol=0.1,
+                               percent=0.99)
 
         # compare
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+        check_accuracy(output, ref_output, rtol=1e-2, atol=0.1, percent=0.99)
 
 
-@skip_pre_hopper
+@skip_no_hopper
 @pytest.mark.parametrize("experts", [8, 128])
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
@@ -2054,12 +2559,8 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
 @pytest.mark.parametrize("dynamic_quant", [True, False])
 def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
-    if not IS_TRITON_KERNELS_AVAILABLE:
-        pytest.skip("Triton kernels are not available")
-    if torch.cuda.get_device_capability()[0] < 10 and fp8_activation:
+    if fp8_activation:
         pytest.skip("Latest Triton requires BF16 activation on Hopper")
-    if torch.cuda.get_device_capability()[0] >= 10 and not fp8_activation:
-        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -2089,14 +2590,30 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE),
                               dtype=dtype).cuda()
 
-        from triton_kernels.numerics_details.mxfp import (
-            downcast_to_mxfp_torch, upcast_from_mxfp_torch)
+        # The fast conversion kernels require a 32-aligned quantization axis.
+        # Pad and slice to cover unaligned intermediate sizes.
+        from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp,
+                                                          upcast_from_mxfp)
+
+        def _pad_quant_axis(tensor, k):
+            padded_k = (k + 31) // 32 * 32
+            if padded_k != k:
+                tensor = torch.nn.functional.pad(tensor,
+                                                 (0, 0, 0, padded_k - k))
+            return tensor
 
         def fp32_to_mxfp4(tensor):
             tensor = tensor.transpose(1, 2).contiguous()
-            tensor_fp4, tensor_scales = downcast_to_mxfp_torch(tensor,
-                                                               torch.uint8,
-                                                               axis=1)
+            k = tensor.shape[1]
+            # MXFP4 packs two values per byte along the quantization axis.
+            assert k % 2 == 0, f"quantization axis must be even, got {k}"
+            tensor_fp4, tensor_scales = downcast_to_mxfp(_pad_quant_axis(
+                tensor, k),
+                                                         torch.uint8,
+                                                         axis=1)
+            # Slice the packed values back to the unpadded logical size; the
+            # scale count (ceil(k / 32)) is unchanged by the padding.
+            tensor_fp4 = tensor_fp4[:, :k // 2]
             tensor_fp4 = tensor_fp4.transpose(1, 2).contiguous()
             tensor_scales = tensor_scales.transpose(1, 2).contiguous()
             return tensor_fp4, tensor_scales
@@ -2104,11 +2621,16 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         def mxfp4_to_fp32(tensor, scales):
             tensor = tensor.transpose(1, 2).contiguous()
             scales = scales.transpose(1, 2).contiguous()
-            tensor = upcast_from_mxfp_torch(tensor,
-                                            scales,
-                                            torch.float32,
-                                            axis=1)
-            return tensor.transpose(1, 2).contiguous()
+            k = tensor.shape[1] * 2
+            # Zero-pad the packed values so the logical size matches the
+            # scale blocks (scales.shape[1] * 32); zero nibbles decode to
+            # 0.0 and are sliced away below.
+            padded_packed = scales.shape[1] * 16
+            if padded_packed != tensor.shape[1]:
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, 0, 0, padded_packed - tensor.shape[1]))
+            tensor = upcast_from_mxfp(tensor, scales, torch.float32, axis=1)
+            return tensor[:, :k].transpose(1, 2).contiguous()
 
         w1_weight_fp4, w1_weight_scale = fp32_to_mxfp4(w1_weight)
         w2_weight_fp4, w2_weight_scale = fp32_to_mxfp4(w2_weight)
@@ -2191,6 +2713,10 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         check_accuracy(output, ref_output, rtol=0.6, atol=0.6, percent=0.945)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.int8])
 def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
@@ -2288,18 +2814,25 @@ def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
             return results
 
         AutoTuner.get().clear_cache()
+        with torch.inference_mode():
+            ref_output = ref()
+
         with torch.inference_mode(), autotune():
             fused_moe.forward(x, router_logits)
 
-        torch.cuda.synchronize()
-        with torch.inference_mode():
+        # Explicitly capture context for kernel testing
+        with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
-            ref_output = ref()
 
-        # compare
-        torch.cuda.synchronize()
+        # Test all kernel tactics
         atol = calc_woq_tolerence(ref_output, weight_dtype)
-        torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
+        for tactic in all_tactics:
+            with AutoTuner.get().replay(tactic), torch.inference_mode():
+                output = fused_moe.forward(x, router_logits)
+                torch.testing.assert_close(output,
+                                           ref_output,
+                                           rtol=1e-7,
+                                           atol=atol)
 
 
 class RefGatedMLPFusedMoE(nn.Module):
@@ -2312,7 +2845,10 @@ class RefGatedMLPFusedMoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  use_cute_dsl_blockscaling_mm: bool = False,
-                 bias=False):
+                 bias=False,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None,
+                 swiglu_limit: Optional[float] = None):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -2323,6 +2859,19 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.dtype = dtype
         self.quant_config = model_config.quant_config
 
+        def custom_swiglu(x):
+            gate, value = x.chunk(2, dim=-1)
+            if swiglu_limit is not None and swiglu_limit != float("inf"):
+                gate = gate.clamp(max=swiglu_limit)
+                value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+            alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
+            gate_act = gate * torch.sigmoid(gate * alpha)
+
+            beta = swiglu_beta if swiglu_beta is not None else 0.0
+
+            return gate_act * (value + beta)
+
         self.experts = nn.ModuleList([
             GatedMLP(
                 hidden_size=self.hidden_size,
@@ -2331,6 +2880,8 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                activation=custom_swiglu
+                if swiglu_alpha is not None else F.silu,
             ) for _ in range(self.num_experts)
         ])
 
@@ -2426,3 +2977,128 @@ class RefGatedMLPFusedMoE(nn.Module):
 
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+    def post_load_weights(self):
+        for expert in self.experts:
+            expert.gate_up_proj.post_load_weights()
+            expert.down_proj.post_load_weights()
+
+
+# Create a mock module with required attributes for NVFP4CutlassFusedMoEMethod.get_weights_shapes test.
+class MockModule:
+
+    def __init__(self, hidden_size, intermediate_size, expand_ratio,
+                 expert_size, bias):
+        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = intermediate_size
+        self.intermediate_size_expand_ratio = expand_ratio
+        self.expand_intermediate_size_per_partition = intermediate_size * self.intermediate_size_expand_ratio
+        self.expert_size_per_partition = expert_size
+        self.bias = bias
+        # Constants for NVFP4.
+        self.scaling_vector_size = 16  # Standard for NVFP4
+        self.weight_vec_size = 16  # 16 fp4 values packed into int64
+        self.block_scales_vec_size = 4  # 4 fp8 values packed into int32
+
+
+def test_nvfp4_cutlass_get_weights_shapes_error_cases():
+    """Test NVFP4CutlassFusedMoEMethod.get_weights_shapes for error cases."""
+    method = NVFP4CutlassFusedMoEMethod()
+    module = MockModule(hidden_size=13,
+                        intermediate_size=16,
+                        expand_ratio=1,
+                        expert_size=4,
+                        bias=False)
+    with pytest.raises(ValueError,
+                       match="hidden_size 13 must be divisible by 4"):
+        method.get_weights_shapes(module, module.weight_vec_size,
+                                  module.block_scales_vec_size)
+
+
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size, expand_ratio, expert_size, bias", [
+        (512, 1024, 1, 32, True),
+        (512, 1024, 2, 32, True),
+        (256, 512, 1, 16, False),
+        (256, 512, 2, 16, False),
+        (128, 120, 1, 8, False),
+        (128, 120, 2, 8, False),
+        (128, 120, 1, 8, True),
+        (128, 120, 2, 8, True),
+    ])
+def test_nvfp4_cutlass_get_weights_shapes(hidden_size, intermediate_size,
+                                          expand_ratio, expert_size, bias):
+    """Test NVFP4CutlassFusedMoEMethod.get_weights_shapes for alignment requirements."""
+    module = MockModule(hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        expand_ratio=expand_ratio,
+                        expert_size=expert_size,
+                        bias=bias)
+    method = NVFP4CutlassFusedMoEMethod()
+    NVFP4_ROW_ALIGNMENT = method.NVFP4_ROW_ALIGNMENT
+
+    # Get weight shapes
+    (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape, w2_bias_shape,
+     w3_w1_weight_scale_shape,
+     w2_weight_scale_shape) = method.get_weights_shapes(
+         module, module.weight_vec_size, module.block_scales_vec_size)
+
+    # Calculate expected aligned sizes
+    intermediate_size_expand = intermediate_size * module.intermediate_size_expand_ratio
+    intermediate_size_expand_aligned = (
+        (intermediate_size_expand + NVFP4_ROW_ALIGNMENT - 1) //
+        NVFP4_ROW_ALIGNMENT * NVFP4_ROW_ALIGNMENT)
+    hidden_size_aligned = hidden_size
+
+    expected_w3_w1_weight_shape = (expert_size,
+                                   intermediate_size_expand_aligned,
+                                   hidden_size_aligned //
+                                   module.weight_vec_size)
+    assert w3_w1_weight_shape == expected_w3_w1_weight_shape, (
+        f"w3_w1_weight_shape mismatch: got {w3_w1_weight_shape}, "
+        f"expected {expected_w3_w1_weight_shape}")
+
+    expected_w2_weight_shape = (expert_size, hidden_size_aligned,
+                                intermediate_size_expand_aligned //
+                                module.intermediate_size_expand_ratio //
+                                module.weight_vec_size)
+    assert w2_weight_shape == expected_w2_weight_shape, (
+        f"w2_weight_shape mismatch: got {w2_weight_shape}, "
+        f"expected {expected_w2_weight_shape}")
+
+    expected_w3_w1_weight_scale_shape = (expert_size,
+                                         intermediate_size_expand_aligned,
+                                         hidden_size_aligned //
+                                         module.scaling_vector_size //
+                                         module.block_scales_vec_size)
+    assert w3_w1_weight_scale_shape == expected_w3_w1_weight_scale_shape, (
+        f"w3_w1_weight_scale_shape mismatch: got {w3_w1_weight_scale_shape}, "
+        f"expected {expected_w3_w1_weight_scale_shape}")
+
+    expected_w2_weight_scale_shape = (expert_size, hidden_size_aligned,
+                                      intermediate_size_expand_aligned //
+                                      module.intermediate_size_expand_ratio //
+                                      module.scaling_vector_size //
+                                      module.block_scales_vec_size)
+    assert w2_weight_scale_shape == expected_w2_weight_scale_shape, (
+        f"w2_weight_scale_shape mismatch: got {w2_weight_scale_shape}, "
+        f"expected {expected_w2_weight_scale_shape}")
+
+    # Verify bias shapes
+    if bias:
+        expected_w3_w1_bias_shape = (expert_size,
+                                     intermediate_size_expand_aligned)
+        expected_w2_bias_shape = (expert_size, hidden_size_aligned)
+        assert w3_w1_bias_shape == expected_w3_w1_bias_shape, (
+            f"w3_w1_bias_shape mismatch: got {w3_w1_bias_shape}, "
+            f"expected {expected_w3_w1_bias_shape}")
+        assert w2_bias_shape == expected_w2_bias_shape, (
+            f"w2_bias_shape mismatch: got {w2_bias_shape}, "
+            f"expected {expected_w2_bias_shape}")
+    else:
+        assert w3_w1_bias_shape is None, f"Expected None for w3_w1_bias_shape, got {w3_w1_bias_shape}"
+        assert w2_bias_shape is None, f"Expected None for w2_bias_shape, got {w2_bias_shape}"
+
+    assert intermediate_size_expand_aligned % NVFP4_ROW_ALIGNMENT == 0, (
+        f"intermediate_size_expand_aligned {intermediate_size_expand_aligned} "
+        f"not aligned to {NVFP4_ROW_ALIGNMENT}")

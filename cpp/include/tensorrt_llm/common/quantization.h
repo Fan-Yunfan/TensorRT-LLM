@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 
@@ -132,6 +134,11 @@ public:
         return QuantMode(BaseType(1u) << 16);
     }
 
+    static constexpr QuantMode mxfp8() noexcept
+    {
+        return QuantMode(BaseType(1u) << 17);
+    }
+
     constexpr BaseType value() const noexcept
     {
         return mValue;
@@ -220,6 +227,11 @@ public:
     constexpr bool hasW4a16Mxfp4() const noexcept
     {
         return isSet(w4a16Mxfp4());
+    }
+
+    constexpr bool hasMxfp8() const noexcept
+    {
+        return isSet(mxfp8());
     }
 
     constexpr bool hasKvCacheQuant() const noexcept
@@ -480,4 +492,5 @@ public:
 };
 
 } // namespace common
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

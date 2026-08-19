@@ -13,13 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion::moe
 {
 template <int NRanks>
 struct LamportComm
@@ -28,9 +32,9 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
         clear_size = *clear_ptr;
         int data_offset = flag_value % 3;
         int clear_offset = (flag_value + 2) % 3;
@@ -46,7 +50,7 @@ struct LamportComm
         }
     }
 
-    __device__ __forceinline__ void update(int new_clear_size)
+    __device__ __forceinline__ void update(int64_t new_clear_size)
     {
         if (blockIdx.x == 0 && threadIdx.x == 0)
         {
@@ -61,10 +65,10 @@ struct LamportComm
 
     int* counter_ptr;
     int* flag_ptr;
-    int* clear_ptr;
+    int64_t* clear_ptr;
     uint8_t* data_bufs[NRanks];
     uint8_t* clear_buf;
-    int clear_size;
+    int64_t clear_size;
     int flag_value;
 };
 
@@ -133,14 +137,22 @@ template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typenam
 __device__ __forceinline__ void fused_op(
     PackedType const& val, int access_id, int token_id, int access_id_in_token, AllReduceFusionParams& params)
 {
-    float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
     float4 gamma_val = reinterpret_cast<float4*>(params.rms_gamma)[access_id_in_token];
-    residual_val = add128<DType>(val, residual_val);
-    if constexpr (ResidualOut)
+    float4 norm_input;
+    if (params.residual_in)
     {
-        reinterpret_cast<float4*>(params.residual_out)[access_id] = residual_val;
+        float4 residual_val = reinterpret_cast<float4*>(params.residual_in)[access_id];
+        norm_input = add128<DType>(val, residual_val);
+        if constexpr (ResidualOut)
+        {
+            reinterpret_cast<float4*>(params.residual_out)[access_id] = norm_input;
+        }
     }
-    float4 norm_val = rms_norm<DType>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
+    else
+    {
+        norm_input = val;
+    }
+    float4 norm_val = rms_norm<DType>(norm_input, gamma_val, params.rms_eps, params.hidden_dim);
     if constexpr (NormOut)
     {
         reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
@@ -431,16 +443,16 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 #define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                \
     return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                       \
-    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF)                                          \
+    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kHALF)                                      \
     {                                                                                                                  \
         MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                                \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    else if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16)                                 \
     {                                                                                                                  \
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }
 
-    TLLM_CHECK(params.residual_in && params.rms_gamma);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.moe_reduction_scale_input && params.moe_reduction_active_experts_token_input
         && params.moe_reduction_token_input);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
@@ -545,11 +557,20 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         }
 
         // * MoE finalize
-        ACC_TYPE accumulator;
+        // Accumulate the top-k weighted expert sum and the shared-expert add in
+        // fp32 (local `facc`), rounding to DType (bf16/fp16) only once when packing
+        // into `accumulator` for the 128-bit Lamport all-reduce store below.
+        // Accumulating directly in DType here rounds after every one of the top_k
+        // terms; across the many routed MoE layers this rounding bias is large
+        // enough to visibly degrade the routed output, and with attention-DP
+        // disabled + MTP speculative decoding it drifts the target hidden states
+        // enough to lower the acceptance length. The non-deferred in-kernel
+        // finalize (do_finalize=true) already accumulates in fp32; match it here.
+        float facc[kElemsPerAccess];
 #pragma unroll
         for (int i = 0; i < kElemsPerAccess; ++i)
         {
-            accumulator.unpacked[i] = static_cast<DType>(0);
+            facc[i] = 0.f;
         }
 
         for (int k = 0; k < top_k; k++)
@@ -571,17 +592,15 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
             permuted_data.packed
                 = reinterpret_cast<float4 const*>(params.allreduce_in)[thread_offset_across_token / kElemsPerAccess];
 
-            // * acc += scale(data)
+            // * acc += scale(data)  (fp32 accumulation)
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                // assume computation is done in ScaleType
-                accumulator.unpacked[i]
-                    += static_cast<DType>((static_cast<float>(permuted_data.unpacked[i]) * block_scale));
+                facc[i] += static_cast<float>(permuted_data.unpacked[i]) * block_scale;
             }
         }
 
-        // * Add shared expert output
+        // * Add shared expert output  (fp32 accumulation)
         if (params.shared_expert_output)
         {
             // * Load shared expert output
@@ -592,8 +611,16 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                accumulator.unpacked[i] += shared_expert_output.unpacked[i];
+                facc[i] += static_cast<float>(shared_expert_output.unpacked[i]);
             }
+        }
+
+        // Round the fp32 accumulator to DType once, packed for the Lamport AR store.
+        ACC_TYPE accumulator;
+#pragma unroll
+        for (int i = 0; i < kElemsPerAccess; ++i)
+        {
+            accumulator.unpacked[i] = static_cast<DType>(facc[i]);
         }
 
         // * AR Store
@@ -716,18 +743,19 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
 #define MOE_FINALIZE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                       \
     return moefinalize_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_FINALIZE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                              \
-    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF                                           \
-        && params.scale_dtype == nvinfer1::DataType::kHALF)                                                            \
+    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kHALF                                       \
+        && params.scale_dtype == tensorrt_llm::DataType::kHALF)                                                        \
     {                                                                                                                  \
         MOE_FINALIZE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16                                      \
-        && params.scale_dtype == nvinfer1::DataType::kBF16)                                                            \
+    else if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16                                  \
+        && params.scale_dtype == tensorrt_llm::DataType::kBF16)                                                        \
     {                                                                                                                  \
         MOE_FINALIZE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                              \
     }
 
     TLLM_CHECK(params.allreduce_in && params.expanded_idx_to_permuted_idx && params.top_k);
+    TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
     if (params.residual_out && not params.norm_out && params.quant_out)
@@ -765,9 +793,21 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
         MOE_FINALIZE_DISPATCH0(8, true, true, true);
         MOE_FINALIZE_DISPATCH0(16, true, true, true);
     }
-    TLLM_CHECK_WITH_INFO(false, "moefinalize_allreduce_fusion_op: unsupported pattern!");
+    // Reaching here means none of the above branches dispatched. Spell out the actual params so
+    // a future dtype/scale_dtype mismatch (e.g. bf16 hidden + fp32 expert weights, see PR #13328)
+    // is debuggable from the assert message alone.
+    TLLM_CHECK_WITH_INFO(false,
+        "moefinalize_allreduce_fusion_op: unsupported pattern! "
+        "nranks=%d, dtype=%d, scale_dtype=%d, "
+        "residual_out=%d, norm_out=%d, quant_out=%d. "
+        "Supported dispatch requires nranks in {2,4,8,16}, dtype==scale_dtype in {kHALF, kBF16}, "
+        "and (residual_out, norm_out, quant_out) in {(1,0,1),(0,1,0),(1,1,0),(1,1,1)}.",
+        params.nranks, static_cast<int>(params.dtype), static_cast<int>(params.scale_dtype),
+        params.residual_out != nullptr, params.norm_out != nullptr, params.quant_out != nullptr);
 #undef MOE_FINALIZE_DISPATCH0
 #undef MOE_FINALIZE_DISPATCH1
 }
 
-}; // namespace tensorrt_llm::kernels::ar_fusion::moe
+}; // namespace kernels::ar_fusion::moe
+
+TRTLLM_NAMESPACE_END

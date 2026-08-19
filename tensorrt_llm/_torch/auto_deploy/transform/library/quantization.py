@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import math
 from functools import partial
 from typing import Dict, List, Tuple
 
@@ -5,16 +20,21 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.quant import (
+from ...custom_ops.quantization.quant import (
     FP4_GLOBAL_SCALE_MAX,
     FP8_MAX,
+    TRTLLM_NVFP4_COLUMN_SIZE,
+    TRTLLM_NVFP4_ROW_SIZE,
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
     is_column_major,
 )
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.logger import ad_logger
 from ...utils.node_utils import (
-    extract_param_names_from_lin_node,
+    WeightBiasInfoCache,
+    extract_op_args,
+    extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
@@ -23,15 +43,18 @@ from ...utils.quantization_utils import (
     fp4_global_scale,
     fp8_scale,
     get_quantization_from_linear_node,
+    is_mixed_precision_config,
     is_quantized_graph,
     is_quantized_op,
+    mixed_precision_has_algo,
     remove_output_quantizers,
+    should_skip_mixed_precision_quantization,
     should_skip_quantization,
 )
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 try:
-    from .....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 
@@ -106,25 +129,45 @@ class Quantization(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+        with WeightBiasInfoCache():
+            qcfg = factory.get_quant_config()
+            if not qcfg:
+                return gm, TransformInfo(
+                    skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                )
+
+            is_mixed = is_mixed_precision_config(qcfg)
+            if is_mixed:
+                if not mixed_precision_has_algo(qcfg, self.algo_name):
+                    return gm, TransformInfo(
+                        skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                    )
+                quantized_layers = qcfg.get("quantized_layers", {})
+            elif (
+                qcfg.get("quant_algo", "").upper() != self.algo_name
+                and qcfg.get("quant_method", "").upper() != self.algo_name
+            ):
+                return gm, TransformInfo(
+                    skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                )
+
+            excluded = qcfg.get("exclude_modules", [])
+            cnt = 0
+            for n in gm.graph.nodes:
+                if not is_linear_op(n):
+                    continue
+                if should_skip_quantization(n, excluded):
+                    continue
+                if is_mixed and should_skip_mixed_precision_quantization(
+                    n, self.algo_name, quantized_layers
+                ):
+                    continue
+                self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+                cnt += 1
+
             return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
             )
-
-        excluded = qcfg.get("exclude_modules", [])
-        cnt = 0
-        for n in gm.graph.nodes:
-            if not is_linear_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            self._insert_quantized_linear(gm, n, is_quantized_graph=False)
-            cnt += 1
-
-        return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
-        )
 
     def _insert_quantized_linear(
         self,
@@ -136,13 +179,15 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        param_name, _ = extract_param_names_from_lin_node(node)
-        original_weight = gm.get_parameter(param_name)
-        new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
-        modname, _, attrname = param_name.rpartition(".")
+        weight_nodes = extract_weight_nodes(node)
+        if len(weight_nodes.weights) == 0:
+            raise ValueError(f"Linear node {node.name} has no weight")
+        lin_weight = weight_nodes.weights[0]
 
-        submod = gm.get_submodule(modname)
-        setattr(submod, attrname, new_param)
+        new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
+        modname, _, attrname = lin_weight.node_key.rpartition(".")
+
+        setattr(lin_weight.submod, attrname, new_param)
 
         # check modelopt quantizers from graph
         if is_quantized_graph:
@@ -159,19 +204,27 @@ class Quantization(BaseTransform):
 
             # when loading the state_dict, we need to convert input amax to input scale
             input_scale_name = self.scale_names()[0]
-            gm._register_load_state_dict_pre_hook(
-                partial(
-                    self.convert_amax_hook,
-                    scale_name=modname + "." + input_scale_name,
-                    amax_name=input_params.amax.target,
-                )
+            scale_name = modname + "." + input_scale_name
+            amax_name = input_params.amax.target
+            hook = partial(
+                self.convert_amax_hook,
+                scale_name=scale_name,
+                amax_name=amax_name,
             )
+            gm._register_load_state_dict_pre_hook(hook)
             # Note: canonicalize_graph() will remove input/weight/output quantizer
 
-        for scale_name, scale in self.default_scales(original_weight.shape).items():
-            submod.register_buffer(scale_name, scale)
+        for scale_name, scale in self.default_scales(lin_weight.tensor.shape).items():
+            lin_weight.submod.register_buffer(scale_name, scale)
 
-        gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
+        gm._register_load_state_dict_pre_hook(
+            partial(self.load_hook, weight_name=lin_weight.node_key)
+        )
+        post_load_hook = getattr(type(self), "post_load_hook", None)
+        if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
 
         with gm.graph.inserting_before(node):
             scales = {}
@@ -180,8 +233,20 @@ class Quantization(BaseTransform):
 
         custom_args = self.build_custom_args_for_linear(scales)
 
+        # Extract sharding hints by name so we don't depend on positional layout.
+        [tp_mode, output_sizes, tp_min_local_shape, layer_type] = extract_op_args(
+            node, "tp_mode", "output_sizes", "tp_min_local_shape", "layer_type"
+        )
+        [inp, weight, bias] = extract_op_args(node, "input", "weight", "bias")
         node.target = self.target_op()
-        node.args = (*node.args, *custom_args)
+        node.args = (inp, weight, bias, *custom_args)
+        node.kwargs = {
+            **node.kwargs,
+            "tp_mode": tp_mode,
+            "output_sizes": output_sizes,
+            "tp_min_local_shape": tp_min_local_shape,
+            "layer_type": layer_type,
+        }
 
     def _insert_quantized_bmm(
         self,
@@ -212,11 +277,12 @@ class Quantization(BaseTransform):
             setattr(submod, attrname, new_param)
 
             # Register load state dict hook
-            gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
-            if self.post_load_hook:
-                gm.register_load_state_dict_post_hook(
-                    partial(self.post_load_hook, weight_name=param_name)
-                )
+            hook = partial(self.load_hook, weight_name=param_name)
+            gm._register_load_state_dict_pre_hook(hook)
+            post_load_hook = getattr(type(self), "post_load_hook", None)
+            if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
+                hook = partial(self.post_load_hook, weight_name=param_name)
+                gm.register_load_state_dict_post_hook(hook)
 
             # Setup scale names and target module for parameter case
             def get_scale_name(scale_name):
@@ -288,12 +354,22 @@ class FP8LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
-        if weight_name in state_dict:
-            weight = state_dict[weight_name]
+        prefix = prefix or ""
+        weight_key = prefix + weight_name
+        if weight_key in state_dict:
+            weight = state_dict[weight_key]
             if weight.dtype != torch.float8_e4m3fn:
-                scale = fp8_scale(state_dict[weight_name])
-                state_dict[weight_name] = (state_dict[weight_name] / scale).to(torch.float8_e4m3fn)
-                state_dict[weight_name + "_scale"] = scale
+                scale = fp8_scale(state_dict[weight_key])
+                state_dict[weight_key] = (state_dict[weight_key] / scale).to(torch.float8_e4m3fn)
+                state_dict[weight_key + "_scale"] = scale
+            else:
+                mod_prefix = prefix + weight_name.rsplit(".", 1)[0]
+                activation_scale_name = mod_prefix + ".activation_scale"
+                weight_scale_inv_name = weight_key + "_scale_inv"
+                if activation_scale_name in state_dict:
+                    state_dict[mod_prefix + ".input_scale"] = state_dict.pop(activation_scale_name)
+                if weight_scale_inv_name in state_dict:
+                    state_dict[mod_prefix + ".weight_scale"] = state_dict.pop(weight_scale_inv_name)
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
         """Convert amax from modelopt quantized graph to scales."""
@@ -301,6 +377,22 @@ class FP8LinearQuantizationFromConfig(Quantization):
             amax = state_dict[amax_name]
             scale = amax / FP8_MAX
             state_dict[scale_name] = scale
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        qcfg = factory.get_quant_config()
+        # Skip if the config specifies block-wise (fine-grained) FP8 quantization via
+        # weight_block_size; those should be handled by FineGrainedFP8LinearQuantization.
+        if qcfg and qcfg.get("weight_block_size"):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        return super()._apply(gm, cm, factory, shared_config)
 
 
 @TransformRegistry.register("quantize_nvfp4_linear_from_config")
@@ -317,20 +409,28 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
     def scale_names(self) -> List[str]:
         return ["input_scale", "weight_scale", "alpha"]
 
+    def _pad_m_n(self, m: int, n: int) -> Tuple[int, int]:
+        """Pad m and n to be divisible by 128 and 4 respectively.
+        Check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
+        """
+        padded_m = math.ceil(m / TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+        padded_n = math.ceil(n / TRTLLM_NVFP4_COLUMN_SIZE) * TRTLLM_NVFP4_COLUMN_SIZE
+        return padded_m, padded_n
+
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
         m, n = original_weight_shape
-        # scaling factors m is padded along 128 and n is padded along 4.
-        # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
         n = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-        padded_m = (m + 127) // 128 * 128
-        padded_n = (n + 3) // 4 * 4
+        padded_m, padded_n = self._pad_m_n(m, n)
         # definition of scales
         # input_scale: FP4_GLOBAL_SCALE_MAX / input_amax
         # weight_scale_2: FP4_GLOBAL_SCALE_MAX / weight_amax
         # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m * padded_n), dtype=torch.uint8),
+            "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.uint8),
+            # "weight_scale": torch.empty((m, n), dtype=torch.uint8),
+            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.float8_e4m3fn),
+            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.uint8),
             "alpha": torch.tensor(1.0 / 6.0),
         }
 
@@ -339,6 +439,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         return ([scales["input_scale"]], [scales["weight_scale"], scales["alpha"]], [], [])
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
+        # Prepend prefix so the hook works when the GraphModule is a submodule
+        # of the model on which load_state_dict is called (e.g., VLM models
+        # where the text model lives at model.language_model.*).
+        weight_name = prefix + weight_name
         if weight_name in state_dict:
             input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"
             alpha_name = weight_name.rsplit(".", 1)[0] + ".alpha"
@@ -358,10 +462,21 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
                     False,
                 )
+                # ``fp4_quantize`` returns the (swizzled) block scale as a flat
+                # 1-D tensor, but ``default_scales`` registers the buffer with the
+                # padded 2-D ``(padded_m, padded_n)`` cutlass shape -- the same
+                # shape the unified-HF-checkpoint branch below produces. Reshape
+                # here so this on-the-fly (bf16 ModelOpt) path stays consistent
+                # with the registered buffer and the HF path; otherwise the flat
+                # scale fails ``load_state_dict`` with a size mismatch.
+                m_w, n_w = weight.shape
+                padded_m, padded_n = self._pad_m_n(m_w, n_w // TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
                 state_dict[weight_name] = weight_fp4
-                state_dict[weight_name + "_scale"] = weight_scale
+                state_dict[weight_name + "_scale"] = weight_scale.reshape(padded_m, padded_n)
                 state_dict[weight_name + "_scale_2"] = weight_scale_2
-                state_dict[alpha_name] = 1 / (weight_scale_2 * state_dict[input_scale_name])
+                state_dict[alpha_name] = 1 / torch.clamp(
+                    weight_scale_2 * state_dict[input_scale_name], min=1e-30
+                )
             # Unified HF ckpt path
             else:
                 if (
@@ -370,19 +485,25 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     and input_scale_name in state_dict
                     and float4_sf_dtype
                 ):
-                    state_dict[alpha_name] = (
-                        state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
-                    )
-                    state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
+                    alpha = state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
+                    alpha = torch.clamp(alpha, min=1e-30)
+                    state_dict[alpha_name] = alpha
+                    input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
+                    state_dict[input_scale_name] = 1 / input_scale
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    ori_shape = weight_scale.shape
-                    state_dict[weight_name + "_scale"] = (
-                        torch.ops.trtllm.block_scale_interleave(
-                            weight_scale.view(torch.uint8).cpu().contiguous()
-                        )
-                        .reshape(ori_shape)
-                        .view(float4_sf_dtype)
-                        .reshape(-1)
+                    # Round the weight block scale factors to 128x4 and then swizzle.
+                    weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
+                        weight_scale.view(torch.uint8).cpu().contiguous()
+                    ).view(float4_sf_dtype)
+
+                    m, n = weight_scale.shape
+                    # scaling factors m is padded along 128 and n is padded along 4.
+                    # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
+                    padded_m, padded_n = self._pad_m_n(m, n)
+                    swizzled_shape = (padded_m, padded_n)
+
+                    state_dict[weight_name + "_scale"] = weight_scale_swizzled.reshape(
+                        swizzled_shape
                     )
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
@@ -481,7 +602,7 @@ class FP8BMMQuantizationFromConfig(Quantization):
     algo_name = "FP8"
 
     def target_op(self):
-        return torch.ops.auto_deploy.torch_quant_fp8_bmm
+        return torch.ops.auto_deploy.torch_quant_fp8_bmm.default
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
@@ -536,23 +657,38 @@ class FP8BMMQuantizationFromConfig(Quantization):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_algo", "").upper() != self.algo_name:
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        if is_mixed_precision_config(qcfg):
+            ad_logger.warning(
+                "FP8 BMM quantization does not support MIXED_PRECISION checkpoints, skipping."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        if qcfg.get("quant_algo", "").upper() != self.algo_name:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
         excluded = qcfg.get("exclude_modules", [])
         cnt = 0
-        for n in gm.graph.nodes:
-            if not is_bmm_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            if self._insert_quantized_bmm(gm, n, is_quantized_graph=False):
-                cnt += 1
+
+        with WeightBiasInfoCache():
+            for n in gm.graph.nodes:
+                if not is_bmm_op(n):
+                    continue
+                if should_skip_quantization(n, excluded):
+                    continue
+                if self._insert_quantized_bmm(gm, n, is_quantized_graph=False):
+                    cnt += 1
 
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
 
 
@@ -583,7 +719,7 @@ class FP8QuantizationFromGraph(FP8LinearQuantizationFromConfig):
 
         remove_output_quantizers(gm)
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
         )
 
 
@@ -612,7 +748,224 @@ class NVFP4QuantizationFromGraph(NVFP4LinearQuantizationFromConfig):
                 self._insert_quantized_linear(gm, n, is_quantized_graph=True)
                 cnt += 1
 
+        # if cnt > 0:
         remove_output_quantizers(gm)
         return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=True
+            skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True
+        )
+
+
+@TransformRegistry.register("quantize_int4_gptq_linear_from_config")
+class INT4GPTQLinearQuantizationFromConfig(Quantization):
+    """Config-based INT4 GPTQ quantization for GPTQ-quantized checkpoints.
+
+    GPTQ uses:
+      - qweight: [K/8, N] int32 (8 packed int4 values per int32)
+      - qzeros: [G, N/8] int32 (packed zero points)
+      - scales: [G, N] float (per-group scales)
+    """
+
+    algo_name = "GPTQ"
+
+    @staticmethod
+    def target_op():
+        return torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear.default
+
+    @staticmethod
+    def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
+        """Returns placeholder qweight tensor [K/8, N] int32."""
+        N, K = original_weight.shape
+        assert K % 8 == 0, "K must be divisible by 8 for GPTQ int4 packing."
+        return torch.empty((K // 8, N), dtype=torch.int32, device=original_weight.device)
+
+    @staticmethod
+    def scale_names() -> List[str]:
+        return ["scales", "qzeros"]
+
+    @staticmethod
+    def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        """Returns placeholder tensors for GPTQ scales and qzeros."""
+        N, K = original_weight_shape
+        BLOCK = 128  # GPTQ group size
+        assert K % BLOCK == 0, "K must be divisible by 128 for GPTQ block quant."
+        assert N % 8 == 0, "N must be divisible by 8 for GPTQ qzeros packing."
+        G = K // BLOCK
+        return {
+            "scales": torch.empty((G, N), dtype=torch.float16),
+            "qzeros": torch.empty((G, N // 8), dtype=torch.int32),
+        }
+
+    @staticmethod
+    def build_custom_args_for_linear(scales: Dict[str, Node]) -> Tuple[object, ...]:
+        """Build args for torch_fake_quant_int4_gptq_linear:
+        (input, weight, bias, input_scale, weight_scale, input_zp, weight_zp)
+        -> input_scale=[], weight_scale=[scales], input_zp=[], weight_zp=[qzeros]
+        """
+        return ([], [scales["scales"]], [], [scales["qzeros"]])
+
+    @staticmethod
+    def load_hook(state_dict, prefix, *args, weight_name: str):
+        """
+        Load hook for GPTQ checkpoints:
+          - qweight: keep as [K/8, N] int32
+          - scales: [G, N] float16
+          - qzeros: [G, N/8] int32
+
+        GPTQ checkpoint uses naming convention:
+          - {prefix}qweight
+          - {prefix}scales
+          - {prefix}qzeros
+        """
+
+        mod_prefix, _, _ = weight_name.rpartition(".")
+
+        qweight_ckpt = f"{mod_prefix}.qweight"
+        scales_ckpt = f"{mod_prefix}.scales"
+        qzeros_ckpt = f"{mod_prefix}.qzeros"
+
+        if qweight_ckpt not in state_dict:
+            return
+
+        qweight = state_dict[qweight_ckpt]
+        if qweight.dtype != torch.int32:
+            return
+
+        K_packed, N = qweight.shape  # [K/8, N]
+        K = K_packed * 8
+
+        assert scales_ckpt in state_dict, f"Missing {scales_ckpt}"
+        scales = state_dict[scales_ckpt]  # [G, N]
+        G = scales.shape[0]
+
+        assert qzeros_ckpt in state_dict, f"Missing {qzeros_ckpt}"
+        qzeros = state_dict[qzeros_ckpt]  # [G, N/8]
+
+        # Validate GPTQ weight layout
+        assert K % G == 0, f"K ({K}) must be divisible by G ({G})"
+        assert scales.shape == (G, N), f"scales shape {scales.shape} != {(G, N)}"
+        assert qzeros.shape == (G, N // 8), f"qzeros shape {qzeros.shape} != {(G, N // 8)}"
+
+        # Map to our buffer names
+        state_dict[weight_name] = qweight  # [K/8, N] int32
+        state_dict[f"{mod_prefix}.scales"] = scales.to(torch.float16)  # [G, N]
+        # GPTQ v1 format stores (zero_point - 1); convert to v2 by adding 0x11111111
+        # See: gptqmodel.utils.model.convert_gptq_v1_to_v2_format_module
+        qzeros_v2 = qzeros + 0x11111111
+        state_dict[f"{mod_prefix}.qzeros"] = qzeros_v2  # [G, N/8] int32 (v2 format)
+        # Remove the original qweight key to avoid "unexpected key" warnings
+        del state_dict[qweight_ckpt]
+
+
+@TransformRegistry.register("quantize_finegrained_fp8_linear_from_config")
+class FineGrainedFP8LinearQuantization(Quantization):
+    """Quantization transform for FineGrainedFP8 (block-wise FP8) models.
+
+    This transform replaces linear ops with the FineGrainedFP8 quantized op.
+    The FineGrained FP8 format uses per-block weight scales (weight_scale_inv) and
+    dynamic input quantization.
+
+    Config format (from HF config.json):
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["lm_head"]
+        }
+    """
+
+    algo_name = "fp8"
+
+    def target_op(self):
+        return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
+
+    def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
+        # Default block size is 128x128 for FineGrained FP8
+        N, K = original_weight_shape
+        block_n, block_k = 128, 128
+        # Use ceil to handle dimensions smaller than or not divisible by block size
+        # (e.g. after TP sharding or small projection weights).
+        scale_shape = (math.ceil(N / block_n), math.ceil(K / block_k))
+        return {"weight_scale_inv": torch.ones(scale_shape, dtype=torch.bfloat16)}
+
+    def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
+        return ([], [scales["weight_scale_inv"]], [], [])
+
+    def load_hook(self, state_dict, prefix, *args, weight_name: str):
+        """Load hook to handle FineGrainedFP8 checkpoint format.
+
+        FineGrained FP8 checkpoints store:
+        - weight: float8_e4m3fn tensor
+        - weight_scale_inv: per-block scale tensor
+        """
+        if weight_name not in state_dict:
+            return
+
+        weight = state_dict[weight_name]
+        if weight.dtype == torch.float8_e4m3fn:
+            scale_inv_name = weight_name + "_scale_inv"
+            if scale_inv_name in state_dict:
+                # Rename to match our buffer name
+                mod_prefix = weight_name.rsplit(".", 1)[0]
+                state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    # NOTE: post_load_hook intentionally inherited as None from the base
+    # `Quantization`. UE8M0 conversion + TMA col-major layout for DeepGEMM is
+    # done atomically inside `_dispatch_trtllm_finegrained_fp8_to_deepgemm`
+    # (transform/library/fuse_quant.py) for every node we actually swap to
+    # `trtllm_fp8_deepgemm`. Doing it there guarantees the graph never carries
+    # a UE8M0 scale paired with a raw-FP32-scale op, which previously caused
+    # NaN whenever dispatch failed to swap (deepgemm op missing in build,
+    # fuse_finegrained_fp8_linear disabled, partial pipeline, etc.).
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        qcfg = factory.get_quant_config()
+        if not qcfg:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        if is_mixed_precision_config(qcfg):
+            ad_logger.warning(
+                "FineGrained FP8 quantization does not support MIXED_PRECISION checkpoints, "
+                "skipping."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        quant_method = str(qcfg.get("quant_method", "")).lower()
+        if quant_method != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        if qcfg.get("weight_block_size") is None:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        excluded = qcfg.get("modules_to_not_convert", [])
+
+        cnt = 0
+        with WeightBiasInfoCache():
+            for n in gm.graph.nodes:
+                if not is_linear_op(n):
+                    continue
+                if should_skip_quantization(n, excluded):
+                    continue
+                self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+                cnt += 1
+
+        return gm, TransformInfo(
+            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
         )

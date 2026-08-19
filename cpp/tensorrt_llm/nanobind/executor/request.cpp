@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/list.h>
@@ -36,6 +37,7 @@
 #include <nanobind/stl/vector.h>
 #include <sstream>
 
+#include <cstring>
 #include <optional>
 #include <vector>
 
@@ -76,12 +78,12 @@ void initRequestBindings(nb::module_& m)
         return nb::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
             self.getTopPResetIds(), self.getTopPDecay(), self.getSeed(), self.getTemperature(), self.getMinTokens(),
             self.getBeamSearchDiversityRate(), self.getRepetitionPenalty(), self.getPresencePenalty(),
-            self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize(),
-            self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
+            self.getFrequencyPenalty(), self.getPromptIgnoreLength(), self.getLengthPenalty(), self.getEarlyStopping(),
+            self.getNoRepeatNgramSize(), self.getNumReturnSequences(), self.getMinP(), self.getBeamWidthArray());
     };
     auto samplingConfigSetstate = [](tle::SamplingConfig& samplingConfig, nb::tuple const& state)
     {
-        if (state.size() != 19)
+        if (state.size() != 20)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -98,12 +100,13 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<FloatType>>(state[10]),                        // RepetitionPenalty
             nb::cast<std::optional<FloatType>>(state[11]),                        // PresencePenalty
             nb::cast<std::optional<FloatType>>(state[12]),                        // FrequencyPenalty
-            nb::cast<std::optional<FloatType>>(state[13]),                        // LengthPenalty
-            nb::cast<std::optional<SizeType32>>(state[14]),                       // EarlyStopping
-            nb::cast<std::optional<SizeType32>>(state[15]),                       // NoRepeatNgramSize
-            nb::cast<std::optional<SizeType32>>(state[16]),                       // NumReturnSequences
-            nb::cast<std::optional<FloatType>>(state[17]),                        // MinP
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[18])           // BeamWidthArray
+            nb::cast<std::optional<SizeType32>>(state[13]),                       // PromptIgnoreLength
+            nb::cast<std::optional<FloatType>>(state[14]),                        // LengthPenalty
+            nb::cast<std::optional<SizeType32>>(state[15]),                       // EarlyStopping
+            nb::cast<std::optional<SizeType32>>(state[16]),                       // NoRepeatNgramSize
+            nb::cast<std::optional<SizeType32>>(state[17]),                       // NumReturnSequences
+            nb::cast<std::optional<FloatType>>(state[18]),                        // MinP
+            nb::cast<std::optional<std::vector<SizeType32>>>(state[19])           // BeamWidthArray
         );
     };
     nb::class_<tle::SamplingConfig>(m, "SamplingConfig")
@@ -120,6 +123,7 @@ void initRequestBindings(nb::module_& m)
                  std::optional<tle::FloatType> const&,              // repetitionPenalty
                  std::optional<tle::FloatType> const&,              // presencePenalty
                  std::optional<tle::FloatType> const&,              // frequencyPenalty
+                 std::optional<tle::SizeType32> const&,             // promptIgnoreLength
                  std::optional<tle::FloatType> const&,              // lengthPenalty
                  std::optional<tle::SizeType32> const&,             // earlyStopping
                  std::optional<tle::SizeType32> const&,             // noRepeatNgramSize
@@ -142,6 +146,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("repetition_penalty") = nb::none(),
             nb::arg("presence_penalty") = nb::none(),
             nb::arg("frequency_penalty") = nb::none(),
+            nb::arg("prompt_ignore_length") = nb::none(),
             nb::arg("length_penalty") = nb::none(),
             nb::arg("early_stopping") = nb::none(),
             nb::arg("no_repeat_ngram_size") = nb::none(),
@@ -165,6 +170,8 @@ void initRequestBindings(nb::module_& m)
             [](tle::SamplingConfig& self, std::optional<FloatType> v) { self.setPresencePenalty(v); })
         .def_prop_rw(
             "frequency_penalty", &tle::SamplingConfig::getFrequencyPenalty, &tle::SamplingConfig::setFrequencyPenalty)
+        .def_prop_rw("prompt_ignore_length", &tle::SamplingConfig::getPromptIgnoreLength,
+            &tle::SamplingConfig::setPromptIgnoreLength)
         .def_prop_rw("length_penalty", &tle::SamplingConfig::getLengthPenalty, &tle::SamplingConfig::setLengthPenalty)
         .def_prop_rw("early_stopping", &tle::SamplingConfig::getEarlyStopping, &tle::SamplingConfig::setEarlyStopping)
         .def_prop_rw("no_repeat_ngram_size", &tle::SamplingConfig::getNoRepeatNgramSize,
@@ -300,22 +307,42 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", loraConfigSetstate);
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
-    { return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths()); };
+    {
+        return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
+            self.getMultimodalUuids(), self.getMultimodalItemRunCuOffsets(), self.getMultimodalRunPositions(),
+            self.getMultimodalRunLengths());
+    };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4 && state.size() != 7)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
+        auto multimodalItemRunCuOffsets = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[4])
+                                                            : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunPositions = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[5])
+                                                        : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunLengths = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[6])
+                                                      : std::optional<std::vector<SizeType32>>(std::nullopt);
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
-            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]));
+            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]),
+            std::move(multimodalItemRunCuOffsets), std::move(multimodalRunPositions), std::move(multimodalRunLengths));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
-        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>>(),
-            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"))
+        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
+                 std::optional<std::vector<std::optional<std::string>>>, std::optional<std::vector<SizeType32>>,
+                 std::optional<std::vector<SizeType32>>, std::optional<std::vector<SizeType32>>>(),
+            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
+            nb::arg("multimodal_uuids") = nb::none(), nb::arg("multimodal_item_run_cu_offsets") = nb::none(),
+            nb::arg("multimodal_run_positions") = nb::none(), nb::arg("multimodal_run_lengths") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
         .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
         .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
+        .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
+        .def_prop_ro("multimodal_item_run_cu_offsets", &tle::MultimodalInput::getMultimodalItemRunCuOffsets)
+        .def_prop_ro("multimodal_run_positions", &tle::MultimodalInput::getMultimodalRunPositions)
+        .def_prop_ro("multimodal_run_lengths", &tle::MultimodalInput::getMultimodalRunLengths)
         .def("__getstate__", multimodalInputGetstate)
         .def("__setstate__", multimodalInputSetstate);
 
@@ -403,7 +430,8 @@ void initRequestBindings(nb::module_& m)
         kvCacheRetentionConfig, "TokenRangeRetentionConfig")
         .def(nb::init<SizeType32, std::optional<SizeType32>, tle::RetentionPriority,
                  std::optional<std::chrono::milliseconds>>(),
-            nb::arg("token_start"), nb::arg("token_end"), nb::arg("priority"), nb::arg("duration_ms") = nb::none())
+            nb::arg("token_start"), nb::arg("token_end").none(), nb::arg("priority"),
+            nb::arg("duration_ms") = nb::none())
         .def_rw("token_start", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenStart)
         .def_rw("token_end", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenEnd)
         .def_rw("priority", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::priority)
@@ -421,7 +449,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
-            nb::arg("directory") = nb::none())
+            nb::arg("directory") = "")
         .def_prop_ro("token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_prop_ro("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
         .def_prop_ro("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
@@ -437,14 +465,16 @@ void initRequestBindings(nb::module_& m)
         {
             auto serializedState = self.getSerializedState();
             return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(),
-                nb::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens());
+                nb::bytes(serializedState.data(), serializedState.size()), self.getDraftTokens(), self.getCtxDpRank(),
+                self.getDisaggInfoEndpoint());
         }
-        return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(), nb::none(), self.getDraftTokens());
+        return nb::make_tuple(self.getFirstGenTokens(), self.getReqId(), nb::none(), self.getDraftTokens(),
+            self.getCtxDpRank(), self.getDisaggInfoEndpoint());
     };
 
     auto ContextPhaseParamsSetState = [](tle::ContextPhaseParams& contextPhaseParams, nb::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid ContextPhaseParams state!");
         }
@@ -455,13 +485,15 @@ void initRequestBindings(nb::module_& m)
             new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
                 nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]),
                 std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()),
-                nb::cast<std::optional<VecTokens>>(state[3]));
+                nb::cast<std::optional<VecTokens>>(state[3]), nb::cast<std::optional<SizeType32>>(state[4]),
+                nb::cast<std::optional<std::string>>(state[5]));
         }
         else
         {
             new (&contextPhaseParams) tle::ContextPhaseParams(nb::cast<VecTokens>(state[0]),
                 nb::cast<tle::ContextPhaseParams::RequestIdType>(state[1]),
-                nb::cast<std::optional<VecTokens>>(state[3]));
+                nb::cast<std::optional<VecTokens>>(state[3]), nb::cast<std::optional<SizeType32>>(state[4]),
+                nb::cast<std::optional<std::string>>(state[5]));
         }
     };
 
@@ -470,25 +502,35 @@ void initRequestBindings(nb::module_& m)
             "__init__",
             [](tle::ContextPhaseParams& self, VecTokens const& first_gen_tokens,
                 tle::ContextPhaseParams::RequestIdType req_id, std::optional<nb::bytes> const& opaque_state,
-                std::optional<VecTokens> const& draft_tokens)
+                std::optional<VecTokens> const& draft_tokens, std::optional<SizeType32> const& ctx_dp_rank,
+                std::optional<std::string> const& disagg_info_endpoint)
             {
                 if (opaque_state)
                 {
                     auto opaque_state_str_view
                         = std::string_view(opaque_state.value().c_str(), opaque_state.value().size());
                     new (&self) tle::ContextPhaseParams(first_gen_tokens, req_id,
-                        std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens);
+                        std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()), draft_tokens,
+                        ctx_dp_rank, disagg_info_endpoint);
                 }
                 else
                 {
-                    new (&self) tle::ContextPhaseParams(first_gen_tokens, req_id, draft_tokens);
+                    new (&self) tle::ContextPhaseParams(
+                        first_gen_tokens, req_id, draft_tokens, ctx_dp_rank, disagg_info_endpoint);
                 }
             },
             nb::arg("first_gen_tokens"), nb::arg("req_id"), nb::arg("opaque_state").none(),
-            nb::arg("draft_tokens").none())
-        .def_prop_ro("first_gen_tokens", [](tle::ContextPhaseParams const& self) { return self.getFirstGenTokens(); })
-        .def_prop_ro("draft_tokens", [](tle::ContextPhaseParams const& self) { return self.getDraftTokens(); })
-        .def_prop_ro("req_id", &tle::ContextPhaseParams::getReqId)
+            nb::arg("draft_tokens").none(), nb::arg("ctx_dp_rank").none(), nb::arg("disagg_info_endpoint").none())
+        .def_prop_rw(
+            "first_gen_tokens", [](tle::ContextPhaseParams const& self) { return self.getFirstGenTokens(); },
+            [](tle::ContextPhaseParams& self, VecTokens const& tokens) { self.setFirstGenTokens(tokens); })
+        .def_prop_rw(
+            "draft_tokens", [](tle::ContextPhaseParams const& self) { return self.getDraftTokens(); },
+            [](tle::ContextPhaseParams& self, std::optional<VecTokens> const& tokens) { self.setDraftTokens(tokens); })
+        .def_prop_rw("req_id", &tle::ContextPhaseParams::getReqId, &tle::ContextPhaseParams::setReqId)
+        .def_prop_rw("ctx_dp_rank", &tle::ContextPhaseParams::getCtxDpRank, &tle::ContextPhaseParams::setCtxDpRank)
+        .def_prop_rw("disagg_info_endpoint", &tle::ContextPhaseParams::getDisaggInfoEndpoint,
+            &tle::ContextPhaseParams::setDisaggInfoEndpoint)
         .def_prop_ro("opaque_state",
             [](tle::ContextPhaseParams const& self)
             {
@@ -564,7 +606,15 @@ void initRequestBindings(nb::module_& m)
 
     auto requestGetstate = [](tle::Request const& self)
     {
-        return nb::make_tuple(self.getInputTokenIds(), self.getMaxTokens(), self.getStreaming(),
+        // Serialize input_token_ids as a raw int32 byte buffer instead of a Python
+        // list[int]: nanobind casts VecTokens element-by-element (a PyLong storm,
+        // ISL-proportional) on every Request pickle -- the request broadcast and the
+        // RPC IPC submit. A bytes blob is a memcpy, ~order-of-magnitude cheaper.
+        // Paired with requestSetstate.
+        auto const& inputTokenIds = self.getInputTokenIds();
+        auto inputTokenIdsBytes = nb::bytes(
+            reinterpret_cast<char const*>(inputTokenIds.data()), inputTokenIds.size() * sizeof(VecTokens::value_type));
+        return nb::make_tuple(std::move(inputTokenIdsBytes), self.getMaxTokens(), self.getStreaming(),
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
             self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
             self.getPromptTuningConfig(), self.getMultimodalInput(), self.getMultimodalEmbedding(),
@@ -573,16 +623,29 @@ void initRequestBindings(nb::module_& m)
             self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
             self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
             self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getCacheSaltID());
+            self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 34)
+        if (state.size() != 35)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&self) tle::Request(nb::cast<VecTokens>(state[0]), nb::cast<SizeType32>(state[1]),
-            nb::cast<bool>(state[2]), nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
+        // input_token_ids is a raw int32 byte buffer (see requestGetstate).
+        auto const inputTokenIdsBytes = nb::cast<nb::bytes>(state[0]);
+        auto constexpr kTokenByteSize = sizeof(VecTokens::value_type);
+        auto const inputTokenIdsByteSize = inputTokenIdsBytes.size();
+        if (inputTokenIdsByteSize % kTokenByteSize != 0)
+        {
+            throw std::runtime_error("Invalid Request state: input_token_ids byte buffer has invalid size!");
+        }
+        VecTokens inputTokenIds(inputTokenIdsByteSize / kTokenByteSize);
+        if (inputTokenIdsByteSize > 0)
+        {
+            std::memcpy(inputTokenIds.data(), inputTokenIdsBytes.c_str(), inputTokenIdsByteSize);
+        }
+        new (&self) tle::Request(std::move(inputTokenIds), nb::cast<SizeType32>(state[1]), nb::cast<bool>(state[2]),
+            nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
             nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
             nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
             nb::cast<std::optional<std::list<VecTokens>>>(state[8]),
@@ -601,50 +664,73 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]),
-            nb::cast<std::optional<tle::CacheSaltIDType>>(state[33]));
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
+    };
+
+    // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
+    // ndarray is memcpy'd into the vector (no per-element PyLong cast, which is
+    // O(ISL) on the GIL-held submit path). Anything else (list[int], etc.) falls
+    // back to the default nanobind sequence cast, so this is fully back-compatible.
+    // This complements PR #15134 (which bytes-encodes Request *pickling*); here we
+    // target Request *construction* on the RpcWorker.submit / _enqueue_request path.
+    auto toVecTokens = [](nb::handle ids) -> tle::VecTokens
+    {
+        nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig> arr;
+        if (nb::try_cast(ids, arr, /*convert=*/false))
+        {
+            tle::VecTokens out(arr.shape(0));
+            if (arr.shape(0) > 0)
+            {
+                std::memcpy(out.data(), arr.data(), arr.shape(0) * sizeof(int32_t));
+            }
+            return out;
+        }
+        return nb::cast<tle::VecTokens>(ids);
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
     request
-        .def(nb::init<tle::VecTokens,                           // inputTokenIds
-                 tle::SizeType32,                               // maxTokens
-                 bool,                                          // streaming
-                 tle::SamplingConfig const&,                    // samplingConfig
-                 tle::OutputConfig const&,                      // outputConfig
-                 std::optional<tle::SizeType32> const&,         // endId
-                 std::optional<tle::SizeType32> const&,         // padId
-                 std::optional<std::vector<SizeType32>>,        // positionIds
-                 std::optional<std::list<tle::VecTokens>>,      // badWords
-                 std::optional<std::list<tle::VecTokens>>,      // stopWords
-                 std::optional<tle::Tensor>,                    // embeddingBias
-                 std::optional<tle::ExternalDraftTokensConfig>, // externalDraftTokensConfig
-                 std::optional<tle::PromptTuningConfig>,        // pTuningConfig
-                 std::optional<tle::MultimodalInput>,           // multimodalInput
-                 std::optional<tle::Tensor>,                    // multimodalEmbedding
-                 std::optional<tle::MropeConfig>,               // mRopeConfig
-                 std::optional<tle::LoraConfig>,                // loraConfig
-                 std::optional<tle::LookaheadDecodingConfig>,   // lookaheadConfig
-                 std::optional<tle::KvCacheRetentionConfig>,    // kvCacheRetentionConfig
-                 std::optional<std::string>,                    // logitsPostProcessorName
-                 std::optional<tle::LogitsPostProcessor>,       // logitsPostProcessor
-                 std::optional<tle::VecTokens>,                 // encoderInputTokenIds
-                 std::optional<tle::IdType>,                    // clientId
-                 bool,                                          // returnAllGeneratedTokens
-                 tle::PriorityType,                             // priority
-                 tle::RequestType,                              // type
-                 std::optional<tle::ContextPhaseParams>,        // contextPhaseParams
-                 std::optional<tle::Tensor>,                    // encoderInputFeatures
-                 std::optional<tle::SizeType32>,                // encoderOutputLength
-                 std::optional<tle::Tensor>,                    // crossAttentionMask
-                 SizeType32,                                    // numReturnSequences
-                 std::optional<tle::EagleConfig>,               // eagleConfig
-                 std::optional<tle::Tensor>,                    // skipCrossAttnBlocks
-                 std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
-                 std::optional<tle::SizeType32>,                // languageAdapterUid
-                 std::optional<tle::MillisecondsType>,          // allottedTimeMs
-                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
-                 >(),
+        .def(
+            "__init__",
+            [toVecTokens](tle::Request* self,
+                nb::handle input_token_ids, // list[int] or int32 ndarray
+                tle::SizeType32 max_tokens, bool streaming, tle::SamplingConfig const& sampling_config,
+                tle::OutputConfig const& output_config, std::optional<tle::SizeType32> const& end_id,
+                std::optional<tle::SizeType32> const& pad_id, std::optional<std::vector<SizeType32>> position_ids,
+                std::optional<std::list<tle::VecTokens>> bad_words, std::optional<std::list<tle::VecTokens>> stop_words,
+                std::optional<tle::Tensor> embedding_bias,
+                std::optional<tle::ExternalDraftTokensConfig> external_draft_tokens_config,
+                std::optional<tle::PromptTuningConfig> prompt_tuning_config,
+                std::optional<tle::MultimodalInput> multimodal_input, std::optional<tle::Tensor> multimodal_embedding,
+                std::optional<tle::MropeConfig> mrope_config, std::optional<tle::LoraConfig> lora_config,
+                std::optional<tle::LookaheadDecodingConfig> lookahead_config,
+                std::optional<tle::KvCacheRetentionConfig> kv_cache_retention_config,
+                std::optional<std::string> logits_post_processor_name,
+                std::optional<tle::LogitsPostProcessor> logits_post_processor,
+                std::optional<tle::VecTokens> encoder_input_token_ids, std::optional<tle::IdType> client_id,
+                bool return_all_generated_tokens, tle::PriorityType priority, tle::RequestType type,
+                std::optional<tle::ContextPhaseParams> context_phase_params,
+                std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
+                std::optional<tle::Tensor> cross_attention_mask, SizeType32 num_return_sequences,
+                std::optional<tle::EagleConfig> eagle_config, std::optional<tle::Tensor> skip_cross_attn_blocks,
+                std::optional<tle::GuidedDecodingParams> guided_decoding_params,
+                std::optional<tle::SizeType32> language_adapter_uid,
+                std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
+                std::optional<std::string> cache_salt)
+            {
+                new (self) tle::Request(toVecTokens(input_token_ids), max_tokens, streaming, sampling_config,
+                    output_config, end_id, pad_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
+                    std::move(embedding_bias), std::move(external_draft_tokens_config), std::move(prompt_tuning_config),
+                    std::move(multimodal_input), std::move(multimodal_embedding), std::move(mrope_config),
+                    std::move(lora_config), std::move(lookahead_config), std::move(kv_cache_retention_config),
+                    std::move(logits_post_processor_name), std::move(logits_post_processor),
+                    std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
+                    std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
+                    std::move(cross_attention_mask), num_return_sequences, std::move(eagle_config),
+                    std::move(skip_cross_attn_blocks), std::move(guided_decoding_params), language_adapter_uid,
+                    allotted_time_ms, disagg_request_id, std::move(cache_salt));
+            },
             // clang-format off
         nb::arg("input_token_ids"),
         nb::arg("max_tokens"),
@@ -683,9 +769,11 @@ void initRequestBindings(nb::module_& m)
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
-        nb::arg("cache_salt_id") = nb::none()
-    )             // clang-format on
+        nb::arg("disagg_request_id") = nb::none(),
+        nb::arg("cache_salt") = nb::none()
+    ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
         .def_prop_rw("sampling_config", &tle::Request::getSamplingConfig, &tle::Request::setSamplingConfig)
@@ -726,8 +814,10 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
-        .def_prop_rw("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
+        .def_prop_rw("cache_salt", &tle::Request::getCacheSalt, &tle::Request::setCacheSalt)
         .def_prop_rw("context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
+        .def_prop_rw("disagg_request_id", &tle::Request::getDisaggRequestId, &tle::Request::setDisaggRequestId)
+        .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
@@ -924,8 +1014,8 @@ void initRequestBindings(nb::module_& m)
         {
             throw std::runtime_error("Invalid Request state!");
         }
-        new (&response) tle::Response(
-            nb::cast<SizeType32>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<SizeType32>(state[2]));
+        new (&response)
+            tle::Response(nb::cast<IdType>(state[0]), nb::cast<tle::Result>(state[1]), nb::cast<IdType>(state[2]));
     };
 
     nb::class_<tle::Response>(m, "Response")

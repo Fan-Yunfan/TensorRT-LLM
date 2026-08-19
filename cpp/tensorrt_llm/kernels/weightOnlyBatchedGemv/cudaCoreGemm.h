@@ -16,14 +16,13 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 #include "tensorrt_llm/runtime/common.h"
-
-#include <NvInferRuntime.h>
 
 #include <cassert>
 #include <cmath>
@@ -35,8 +34,8 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cuda_core_gemm
@@ -95,4 +94,5 @@ struct Params
 bool cudaCoreGemmDispatcher(Params const& params, cudaStream_t stream);
 } // namespace cuda_core_gemm
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from typing import List, Tuple
 
@@ -29,7 +43,7 @@ class CleanupInputConstraints(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
-        input_node = graph.find_nodes(op="placeholder")[0]
+        input_node = graph.find_nodes(op="placeholder")[1]
         sym_shape: torch.Size = input_node.meta["val"].shape
 
         # get expressions in the symbolic shape
@@ -52,6 +66,11 @@ class CleanupInputConstraints(BaseTransform):
             object.__setattr__(vr, "upper", max_total)
 
         # store info object about the transform
-        info = TransformInfo(skipped=False, num_matches=len(vrs))
+        info = TransformInfo(
+            skipped=False,
+            num_matches=len(vrs),
+            is_clean=len(vrs) == 0,
+            has_valid_shapes=len(vrs) == 0,
+        )
 
         return gm, info

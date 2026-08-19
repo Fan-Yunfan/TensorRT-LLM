@@ -1,9 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Patches for the PixtralVisionModel to make it compatible with `torch.export`.
 
 On top of the patching, `custom_op`s are registered to replace specific parts of the Pixtral model's
 forward pass that are not compatible with `torch.export`. Note that the `register_fake` portion of
 the ops needs to return the shape (and dtype) of the output tensor(s) without accessing the values in
 the input tensors, which is where things get tricky, and why so many custom ops / patches are needed.
+
+NOTE: most patches are not used at the moment since only text submodule is exported. Keeping it here
+for future reference in case we decide to also export the image model.
 """
 
 import torch
@@ -14,7 +31,7 @@ from transformers.models.pixtral.modeling_pixtral import (
     position_ids_in_meshgrid,
 )
 
-from ...export.interface import BaseExportPatch, ExportPatchRegistry
+from ...export.interface import DisabledBaseExportPatch, ExportPatchRegistry
 
 # NOTES:
 # 1. Everything decorated by a `custom_op` must be type annotated.
@@ -53,7 +70,7 @@ def _process_patch_embeds_meta(
     image_sizes: torch.Tensor,
     patch_size: int,
     hidden_size: int,
-    max_widht: int,
+    max_width: int,
 ):
     B = (image_sizes // patch_size).prod(dim=1).sum()
     device = patch_embeds.device
@@ -210,8 +227,9 @@ def _pixtral_rms_norm_forward(self, hidden_states):
     return self.weight * hidden_states.to(input_dtype)
 
 
+# NOTE: registered as patch that is disabled by default since it is not used at the moment
 @ExportPatchRegistry.register("hf_pixtral_vit")
-class PixtralVisionModelPatch(BaseExportPatch):
+class PixtralVisionModelPatch(DisabledBaseExportPatch):
     """Patch for `PixtralVisionModel`."""
 
     def _apply_patch(self):
@@ -229,3 +247,27 @@ class PixtralVisionModelPatch(BaseExportPatch):
         PixtralVisionModel.forward = self.original_values["PixtralVisionModel.forward"]
         Mistral3PatchMerger.forward = self.original_values["Mistral3PatchMerger.forward"]
         PixtralRMSNorm.forward = self.original_values["PixtralRMSNorm.forward"]
+
+
+# NOTE: registered as patch that is disabled by default since it is applied globally...
+@ExportPatchRegistry.register("hf_pixtral_dtype")
+class PixtralDtypePatch(DisabledBaseExportPatch):
+    """Patch for `PixtralVisionModel`."""
+
+    def _apply_patch(self):
+        """Fix the dtype of pixel_values to align with pixtral weights dtype."""
+
+        def _forward(mod: PixtralVisionModel, pixel_values: torch.Tensor, *args, **kwargs):
+            pixel_values = pixel_values.to(mod.patch_conv.weight.dtype)
+            return self.original_values["forward"](mod, pixel_values, *args, **kwargs)
+
+        self.original_values["forward"] = PixtralVisionModel.forward
+        PixtralVisionModel.forward = _forward
+
+    def _revert_patch(self):
+        """Revert the PixtralVisionModel patch."""
+        PixtralVisionModel.forward = self.original_values["forward"]
+
+
+# TODO: figure out how to properly register and apply patches like this that are global
+ExportPatchRegistry.create_patch("hf_pixtral_dtype", {"enabled": True}).__enter__()

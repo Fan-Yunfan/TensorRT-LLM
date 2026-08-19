@@ -15,8 +15,10 @@
  */
 #pragma once
 
+#include "cascadeAttentionKernel.h"
 #include "decoderMaskedMultiheadAttentionTemplate.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -32,8 +34,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -421,6 +423,25 @@ void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_
             || params.position_embedding_type == PositionEmbeddingType::kROPE_GPTJ
             || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE
             || params.position_embedding_type == PositionEmbeddingType::kROPE_M));
+    // Try cascade-attention path before falling through to the standard MMHA.
+    // Restricted to self-attention, beam search, narrow type/Dh subset and
+    // gated by env vars; otherwise short-circuits cheaply.
+    constexpr bool kCascadeTypeOk = std::is_same_v<T, half>
+#ifdef ENABLE_BF16
+        || std::is_same_v<T, __nv_bfloat16>
+#endif
+        ;
+    if constexpr (!KernelParamsType::DO_CROSS_ATTENTION && !BLOCK_SPARSE_ATTN && !IMPLICIT_REL_ATTN_BIAS
+        && !ATTN_LOGIT_SOFTCAPPING && (Dh == 128) && kCascadeTypeOk)
+    {
+        if (params.beam_width > 1 && cascade::cascade_eligible(params))
+        {
+            if (cascade::launch_cascade_attention<T, T, KVCacheBuffer, Dh>(params, kv_cache_buffer, stream))
+            {
+                return;
+            }
+        }
+    }
     if (params.beam_width == 1)
     {
         mmha_launch_kernel_dispatch<T, KVCacheBuffer, KernelParamsType, Dh, false, BLOCK_SPARSE_ATTN,
@@ -492,4 +513,5 @@ void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_
         const KVLinearBuffer& shift_k_cache, const cudaStream_t& stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

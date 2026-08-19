@@ -21,7 +21,6 @@ import torch
 import torchvision
 import transformers
 from einops import rearrange
-from PIL import Image
 from torchvision.transforms.functional import get_image_size, pad, resize
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import (ImageInput, is_pil_image,
@@ -32,17 +31,19 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
-from ...inputs import (BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
-from ...lora_helper import LoraConfig
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..peft.lora.config import LoraConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
+                                        fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import register_auto_model
 
@@ -73,10 +74,6 @@ def _is_torch_compile() -> bool:
     return os.getenv("TLLM_MULTIMODAL_ENCODER_TORCH_COMPILE", "0") == "1"
 
 
-def _is_disagg() -> bool:
-    return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
-
-
 # Load the Phi4MM classes from HuggingFace Phi-4-multimodal-instruct repo.
 # Remove this function by using the transformers version of Phi4Multimodal when weights/configs are converted to transformers format.
 def _load_phi4mm_classes(local_path):
@@ -88,10 +85,10 @@ def _load_phi4mm_classes(local_path):
     # Add parent folder to sys.path to enable relative import.
     original_sys_path = sys.path.copy()
     package_folder = Path(local_path)
+    package_name = package_folder.name
     parent_folder = str(package_folder.parent)
     if parent_folder not in sys.path:
         sys.path.insert(0, parent_folder)
-
     try:
         # Import Phi4MMConfig from configuration_phi4mm.py.
         config_path = os.path.join(local_path, 'configuration_phi4mm.py')
@@ -111,9 +108,13 @@ def _load_phi4mm_classes(local_path):
         # `Phi-4-multimodal-instruct` as the package name to avoid relative import errors.
         # `hf_modeling_phi4mm` as the module name to avoid name conflicts.
         spec = importlib.util.spec_from_file_location(
-            "Phi-4-multimodal-instruct.hf_modeling_phi4mm",
-            modeling_phi4mm_path)
+            f"{package_name}.hf_modeling_phi4mm", modeling_phi4mm_path)
         hf_modeling_phi4mm = importlib.util.module_from_spec(spec)
+        # transformers 5.3.0 merged SlidingWindowCache into StaticCache, but the
+        # model's custom modeling_phi4mm.py still imports it. Alias it so the
+        # import succeeds.
+        _cache_utils = importlib.import_module("transformers.cache_utils")
+        _cache_utils.SlidingWindowCache = _cache_utils.StaticCache
         spec.loader.exec_module(hf_modeling_phi4mm)
         Phi4MMAudioEmbedding = hf_modeling_phi4mm.Phi4MMAudioEmbedding
         Phi4MMImageEmbedding = hf_modeling_phi4mm.Phi4MMImageEmbedding
@@ -544,7 +545,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
     config_class = Phi4MMConfig
     base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
 
@@ -756,31 +757,34 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
         return self._encoding_batch_request(multimodal_params, mm_token_ids)
 
 
-class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
+class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
     def __init__(self,
                  model_path: str,
-                 model_config: transformers.PretrainedConfig,
+                 config: transformers.PretrainedConfig,
                  tokenizer: transformers.AutoTokenizer,
-                 trust_remote_code: bool = True):
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
         if not trust_remote_code:
             raise ValueError("trust_remote_code must be True for Phi4MM")
 
-        self.model_config = model_config
-        self.device = 'cpu'
-
-        self.tokenizer = tokenizer
-        self.use_fast = True
-        if self.tokenizer is None:
-            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                model_path,
-                trust_remote_code=trust_remote_code,
-                use_fast=self.use_fast)
-
-        self.processor = transformers.AutoProcessor.from_pretrained(
+        self._config = config
+        self._tokenizer = tokenizer if tokenizer is not None else transformers.AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             use_fast=self.use_fast)
+        self._processor = transformers.AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._model_path = model_path
+        self._dtype = self.config.torch_dtype
         # Bind the optimized methods to the image processor instance
         self.processor.image_processor.dynamic_preprocess = MethodType(
             dynamic_preprocess,
@@ -790,8 +794,27 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
             image_preprocess,
             self.processor.image_processor,
         )
+        self.device = 'cpu'
 
-        self.dtype = model_config.torch_dtype
+    @property
+    def config(self) -> transformers.PretrainedConfig:
+        return self._config
+
+    @property
+    def tokenizer(self) -> transformers.AutoTokenizer:
+        return self._tokenizer
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    @property
+    def processor(self) -> transformers.AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
         return torch.tensor([_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
@@ -801,7 +824,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: torch.Tensor,
         **kwargs,
     ):
         images = [image]
@@ -872,7 +895,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         return inputs
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
@@ -924,13 +947,14 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor, InputProcessor):
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
+        content_format=ContentFormat.STRING,
     ))
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise ValueError(
                 "Phi4MM does not support disaggregated inference yet.")
 
@@ -941,7 +965,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             _load_phi4mm_classes(config._name_or_path)
 
             self.hf_phi4mm_model = HFPhi4MultimodalEncoder(config).eval()
@@ -962,7 +986,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
     def load_weights(self, weights):
         # Load weights into HFPhi4MultimodalEncoder.
-        if not _is_disagg():
+        if not _is_mm_disagg():
             filtered_weights = {}
             for k, v in weights.items():
                 # Skip image_embed head weights since we set it as NoOp.
@@ -989,19 +1013,34 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = {k: v for k, v in weights.items() if '.lora_' not in k}
         # Rename base layer weights.
         updated_weights = {}
+        base_layer_weight_names = [
+            'weight', 'input_scale', 'weight_scale', 'weight_scale_2'
+        ]
         for k in weights.keys():
-            if 'base_layer.weight' in k:
-                new_k = k.replace('base_layer.weight', 'weight')
-                updated_weights[new_k] = weights[k]
-            else:
-                updated_weights[k] = weights[k]
+            new_k = k
+            for weight_name in base_layer_weight_names:
+                if f'base_layer.{weight_name}' in k:
+                    new_k = k.replace(f'base_layer.{weight_name}', weight_name)
+                    break
+            updated_weights[new_k] = weights[k]
         weights = updated_weights
         self.llm.load_weights(weights)
 
-        # Move mm_token_ids to the correct device.
         self.mm_token_ids = torch.tensor(
-            [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
-            device=self.device)
+            [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID])
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
+    @mm_token_ids.setter
+    def mm_token_ids(self, token_ids: torch.Tensor) -> None:
+        self._mm_token_ids = token_ids.to("cpu")
+        self._mm_token_ids_device = token_ids.to(self.device)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
@@ -1041,9 +1080,9 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embedding = []
         if len(multimodal_params) > 0:
-            if not _is_disagg():
+            if not _is_mm_disagg():
                 encoder_kwargs = {
-                    "mm_token_ids": self.mm_token_ids,
+                    "mm_token_ids": self._mm_token_ids_device,
                 }
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self.hf_phi4mm_model.forward,
@@ -1062,8 +1101,9 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=self.mm_token_ids,
-            **kwargs,
+            mm_token_ids=self._mm_token_ids_device,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         output_prob = self.llm.forward(

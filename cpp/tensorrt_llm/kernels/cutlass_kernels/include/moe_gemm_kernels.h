@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <array>
 #include <cuda_runtime_api.h>
 #include <optional>
@@ -35,7 +36,9 @@
 #include <cuda_fp4.h>
 #endif
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 
 template <typename AType, typename BType, typename BScaleType, typename OType>
@@ -297,10 +300,12 @@ public:
     void moeGemm(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
         TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
-    std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(bool supports_finalize_fusion) const;
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(int sm, bool supports_finalize_fusion);
+    std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(
+        bool supports_finalize_fusion, bool use_mxfp8 = false) const;
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(
+        int sm, bool supports_finalize_fusion, bool use_mxfp8 = false);
     static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(
-        int sm, bool supports_finalize_fusion);
+        int sm, bool supports_finalize_fusion, bool use_mxfp8 = false);
     static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
     [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
@@ -315,7 +320,7 @@ public:
         ActivationType activation_type, int gemm_n, int gemm_k) const;
     [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;
 
-    size_t getMaxWorkspaceSize(int num_experts) const;
+    size_t getMaxWorkspaceSize(int num_experts, bool use_mxfp8_weight_scaling = false) const;
 
     [[nodiscard]] int getSM() const;
 
@@ -332,8 +337,11 @@ private:
     int sm_{};
     int multi_processor_count_{};
     mutable int num_experts_ = 0;
+    mutable bool use_mxfp8_weight_scaling_ = false;
     mutable size_t gemm_workspace_size_ = 0;
-    size_t calcMaxWorkspaceSize(int num_experts) const;
+    size_t calcMaxWorkspaceSize(int num_experts, bool use_mxfp8_weight_scaling) const;
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

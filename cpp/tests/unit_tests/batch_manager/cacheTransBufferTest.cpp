@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -41,6 +42,7 @@ protected:
         auto const stream = std::make_shared<CudaStream>();
 
         auto kvMaxNumTokens = tokensPerBlock * maxBlocksPerSeq;
+        auto maxSequenceLength = kvMaxNumTokens;
         auto maxAttentionWindow = kvMaxNumTokens;
         auto inputLength = kvMaxNumTokens - tokensPerBlock - 1;
         auto numSharedBlocks = inputLength / tokensPerBlock;
@@ -50,15 +52,14 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = true;
-        auto constexpr onboardBlocks = true;
-        auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+        auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            std::nullopt, dataType, sinkTokenLength, stream, kvMaxNumTokens, enableBlockReuse, onboardBlocks, cacheType,
+            dataType, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse, cacheType,
             std::nullopt, nullptr, true);
 
         mCacheManager->allocatePools(false);
@@ -114,8 +115,8 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize)
             {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
         tensorrt_llm::executor::CacheTransceiverConfig cacheTransceiverConfig{
             tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
-        size_t bufferSizeBytes
-            = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
+        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(
+            cacheSizeBytesPerTokenPerWindow, tokensPerBlock, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);
@@ -156,8 +157,8 @@ TEST_F(CacheTransBufferTest, TestPreAllocBufferSize2)
             tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, maxNumTokens};
         std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow{
             {maxBlocksPerSeq * tokensPerBlock, cacheSizeBytesPerToken}};
-        size_t bufferSizeBytes
-            = CacheTransBufferManager::preAllocBufferSize(cacheSizeBytesPerTokenPerWindow, cacheTransceiverConfig);
+        size_t bufferSizeBytes = CacheTransBufferManager::preAllocBufferSize(
+            cacheSizeBytesPerTokenPerWindow, tokensPerBlock, cacheTransceiverConfig);
         auto bufferId = mTransBufferManager->assignBufferIndexForSend();
         EXPECT_TRUE(bufferId.has_value());
         EXPECT_EQ(bufferId.value(), 0);

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -25,7 +26,9 @@
 using namespace tensorrt_llm::common;
 using tensorrt_llm::common::op::UniqPtrWNullCopy;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -58,8 +61,12 @@ struct XqaFixedParams
     bool isPagedKv;
     // Is speculative decoding enabled.
     bool isSpecDecoding;
+    // Spec-dec tree bound for FMHA kernel selection.
+    int specDecodingTargetMaxGenLen = 0;
     // Do we apply alibi ?
     bool hasAlibi;
+    // Use trtllm-gen sparse attention kernel.
+    bool useTllmGenSparseAttention;
 };
 
 class XqaDispatcher
@@ -114,4 +121,6 @@ constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

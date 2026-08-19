@@ -30,7 +30,7 @@ In this blog, we share the configurations and procedures about how to reproduce 
       - [Expected Result Format](#expected-result-format-3)
   - [Exploring more ISL/OSL combinations](#exploring-more-islosl-combinations)
     - [WIP: Enable more features by default](#wip-enable-more-features-by-default)
-    - [Not supported: MLA chunked context support on Hopper](#not-supported-mla-chunked-context-support-on-hopper)
+    - [MLA chunked context](#mla-chunked-context)
     - [Out of memory issues](#out-of-memory-issues)
 
 
@@ -69,8 +69,11 @@ For NVIDIA Hopper GPUs, it's recommended to use the FP8 version of the DeepSeek 
 YOUR_MODEL_PATH=<YOUR_MODEL_PATH>
 cd $YOUR_MODEL_PATH
 
-## Download FP4 model for Blackwell GPUs
-git clone https://huggingface.co/nvidia/DeepSeek-R1-FP4
+## Download NVFP4 model for Blackwell GPUs
+git clone https://huggingface.co/nvidia/DeepSeek-R1-NVFP4-v2
+
+## Or the 0528 version
+git clone https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2
 
 ## Download FP8 model for Hopper GPUs
 ## FP8 model also works for Blackwell, but FP4 has the best performance on Blackwell.
@@ -89,7 +92,7 @@ Here we set `LOCAL_USER=1` argument to set up the local user instead of root acc
 Here we compile the source inside the container:
 
 ``` bash
-python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --cuda_architectures "90-real;100-real"  --python_bindings --clean
+python3 ./scripts/build_wheel.py --cuda_architectures "90-real;100-real" --clean
 ```
 You can set the cuda_architectures to "100-real" if targeting Blackwell only, and "90-real" to target Hopper only to save some build time.
 
@@ -136,7 +139,7 @@ To do the benchmark, run the following command:
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 moe_config:
   backend: TRTLLM
 speculative_config:
@@ -154,18 +157,18 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     --max_batch_size 1 \
     --tp 8 \
     --ep 2 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 Explanation:
-- `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
+- `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published results. See [TensorRT LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
 - `--dataset`: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K
 - `--num_requests`: Num requests used for the benchmark.
 - `--concurrency`: Total concurrency for the system.
 - `--max_batch_size`: Max batch size in each rank.
 - `--tp`: Tensor parallel size.
 - `--ep`: Expert parallel size.
-- `--extra_llm_api_options`: Used to specify some extra config. The content of the file is as follows:
+- `--config`: Used to specify extra YAML configuration. The content of the file is as follows:
 
 #### Expected Results
 The perf can be different when using different datasets and different machines.
@@ -184,7 +187,7 @@ Average request latency (ms):                     7456.1219
 ```
 ### B200 max-throughput for R1-0528 with FP8 KV cache
 
-Due to our evaluation found that FP8 KV cache does not introduce obvious accuracy drop compared to BF16 KV cache. See [Precision strategy](./tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md#precision-strategy), the latest [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4) checkpoint had enabled FP8 KV cache by-default.
+Due to our evaluation found that FP8 KV cache does not introduce obvious accuracy drop compared to BF16 KV cache. See [Precision strategy](./tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md#precision-strategy), the latest [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4) checkpoint had enabled FP8 KV cache by-default.
 
 We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers here. The results are reproduced with TensorRT LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
 
@@ -192,7 +195,7 @@ We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers
 
 #### Benchmark
 ```bash
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -215,7 +218,7 @@ trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
      throughput
      --dataset ${YOUR_DATA_PATH}
      --tp 8  --ep 8
-     --extra_llm_api_options ./extra-llm-api-config.yml
+     --config ./config.yml
      --max_batch_size 896
      --max_num_tokens 2048
      --kv_cache_free_gpu_mem_fraction 0.93
@@ -248,17 +251,17 @@ To do the benchmark, run the following command:
 
 ```bash
 # generate synthetic dataset
-python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
-        --stdout \
-        --tokenizer nvidia/DeepSeek-R1-FP4 \
+trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
+        prepare-dataset \
+        --output dataset.txt \
         token-norm-dist \
         --input-mean 1024 --output-mean 2048 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 49152 > dataset.txt
+        --num-requests 49152
 
 YOUR_DATA_PATH=./dataset.txt
 
-cat >./extra-llm-api-config.yml <<EOF
+cat >./config.yml <<EOF
 cuda_graph_config:
   enable_padding: true
   batch_sizes:
@@ -287,7 +290,7 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --num_requests 49152 \
     --concurrency 3072 \
     --kv_cache_free_gpu_mem_fraction 0.85 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 #### Expected Result Format
@@ -312,7 +315,7 @@ To do the benchmark, run the following command:
 ```bash
 YOUR_DATA_PATH=<your dataset file following the format>
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -326,7 +329,7 @@ trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     --tp 8 \
     --ep 4 \
     --concurrency 1 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 #### Expected Result Format
@@ -350,16 +353,17 @@ To do the benchmark, run the following command:
 
 ```bash
 # generate synthetic dataset
-python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
-        --stdout \
-        --tokenizer deepseek-ai/DeepSeek-R1 \
+trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
+        prepare-dataset \
+        --output dataset.txt \
         token-norm-dist \
         --input-mean 1024 --output-mean 2048 \
         --input-stdev 0 --output-stdev 0 \
-        --num-requests 5120 > dataset.txt
+        --num-requests 5120
+
 YOUR_DATA_PATH=./dataset.txt
 
-cat >./extra-llm-api-config.yml<<EOF
+cat >./config.yml<<EOF
 cuda_graph_config:
   batch_sizes:
   - 128
@@ -380,7 +384,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --num_requests 5120 \
     --concurrency 1024 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
-    --extra_llm_api_options ./extra-llm-api-config.yml
+    --config ./config.yml
 ```
 
 #### Expected Result Format
@@ -401,23 +405,23 @@ Average request latency (ms):                     181540.5739
 
 ## Exploring more ISL/OSL combinations
 
-To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use `prepare_dataset.py` to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
+To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the `trtllm-bench prepare-dataset` subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
 ### WIP: Enable more features by default
 
-Currently, there are some features that need to be enabled through a user-defined file `extra-llm-api-config.yml`, such as CUDA graph, overlap scheduler and attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
+Currently, there are some features that need to be enabled through a user-defined file `config.yml`, such as attention dp. We're working on enabling those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
 
 Note that, `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 
 Generally, you should make sure that `max_batch_size` is not too low to bottleneck the throughput, and `max_num_tokens` needs to be large enough so that it covers the max input sequence length of the samples in dataset, as mentioned in below section "WIP: Chunked context support on DeepSeek models".
 
-For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### MLA chunked context
 
-MLA currently supports the chunked context feature on both Hopper and Blackwell GPUs. You can use `--enable_chunked_context` to enable it. This feature is primarily designed to reduce TPOT (Time Per Output Token). The default chunk size is set to `max_num_tokens`. If you want to achieve a lower TPOT, you can appropriately reduce the chunk size. However, please note that this will also decrease overall throughput. Therefore, a trade-off needs to be considered. 
+MLA currently supports the chunked context feature on both Hopper and Blackwell GPUs. You can use `--enable_chunked_context` to enable it. This feature is primarily designed to reduce TPOT (Time Per Output Token). The default chunk size is set to `max_num_tokens`. If you want to achieve a lower TPOT, you can appropriately reduce the chunk size. However, please note that this will also decrease overall throughput. Therefore, a trade-off needs to be considered.
 
-For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Out of memory issues
 
-It's possible seeing OOM issues on some cases. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.
+It's possible to see OOM issues in some cases. Consider reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.

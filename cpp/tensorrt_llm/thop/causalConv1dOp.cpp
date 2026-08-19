@@ -24,6 +24,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -262,9 +264,9 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
     if (conv_state_indices_.has_value())
     {
         auto conv_state_indices = conv_state_indices_.value();
-        TORCH_CHECK(conv_state_indices.scalar_type() == torch::kInt32)
+        TORCH_CHECK(conv_state_indices.scalar_type() == torch::kInt32);
         TORCH_CHECK(conv_state_indices.is_cuda());
-        TORCH_CHECK(conv_state_indices.stride(0) == 1)
+        TORCH_CHECK(conv_state_indices.is_contiguous());
         CHECK_SHAPE(conv_state_indices, batch_size);
 
         int conv_state_entries = conv_state.size(0);
@@ -288,6 +290,8 @@ void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::T
 }
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
@@ -315,6 +319,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("causal_conv1d_fwd", &torch_ext::causalConv1dFwd);
-    m.impl("causal_conv1d_update", &torch_ext::causalConv1dUpdate);
+    m.impl("causal_conv1d_fwd", &tensorrt_llm::torch_ext::causalConv1dFwd);
+    m.impl("causal_conv1d_update", &tensorrt_llm::torch_ext::causalConv1dUpdate);
 }

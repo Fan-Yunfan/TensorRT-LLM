@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "cuda_hint.cuh"
@@ -42,6 +47,10 @@ static_assert(specDecQLen * headGrpSize <= 32, "SPEC_Q_SEQ_LEN macro value is to
 #define SWAP_AB 1
 #else
 #define SWAP_AB (!SPEC_DEC)
+#endif
+
+#if SKIP_SOFTMAX_ATTN
+static_assert(SWAP_AB && USE_PAGED_KV_CACHE && !SPEC_DEC && BEAM_WIDTH == 1, "SKIP_SOFTMAX_ATTN is not supported.");
 #endif
 
 #define IS_SUPPORTED_F16_CASE (CACHE_ELEM_ENUM == 0 && !SPEC_DEC && SWAP_AB && !USE_INPUT_KV && !LOW_PREC_OUTPUT)
@@ -133,25 +142,37 @@ using PaddedOutHead = PaddedInputHead;
 
 struct alignas(128) SharedMem
 {
+    using QBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerQPart>, nbQParts>;
     using KBuffer = Array2D<LdGrain, gemm0CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes)>;
-    static constexpr uint32_t nbKBuf = 2;
-    KBuffer k[nbKBuf]; // as is loaded from global mem.
     using XBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerXPart>, nbXParts>;
-    static constexpr uint32_t nbXBuf
-        = 2 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
     using VBuffer = Vec<Array2D<LdGrain, gemm1CtaTileNbTokens, exactDiv(cacheHeadPartBytes, grainBytes),
                             sizeof(XBuffer) % (cacheHeadPartBytes * 8) == 0>,
         cacheHeadNbParts>;
 #if !SWAP_AB
     using VTBuffer = Array2D<LdGrain, headElems, exactDiv(gemm1CtaTileNbTokens, cacheElemsPerGrain), true>;
 #endif
-    static constexpr uint32_t nbVBuf = 2;
 #if CACHE_ELEM_ENUM == 0
     using OutSwizzleBuf = Array2D<LdGrain, ctaNbQHeads, grainsPerPaddedInputHead>;
 #elif CACHE_ELEM_ENUM == 2
     using OutSwizzleBuf = Array2D<Vec<Vec<InputElem, 4>, 4>, ctaNbQHeads, exactDiv(headElems, 4 * 4)>;
 #endif
+
+#if SKIP_SOFTMAX_ATTN
+    static constexpr uint32_t nbKBuf = 2;
+    static constexpr uint32_t nbVBuf = 3; // @fixme: skip_softmax_attn: for skip softmax attn, an extra VBuffer is used
+    static constexpr uint32_t nbXBuf
+        = 3 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
+#else
+    static constexpr uint32_t nbKBuf = 2;
+    static constexpr uint32_t nbVBuf = 2;
+    static constexpr uint32_t nbXBuf
+        = 2 * (gemm0CtaTileNbTokens >= gemm1CtaTileNbTokens ? 1 : exactDiv(gemm1CtaTileNbTokens, gemm0CtaTileNbTokens));
+#endif
     static_assert(nbXBuf == nbVBuf);
+
+    // note: buffers used for GMMA may have additional alignment requirements
+    KBuffer k[nbKBuf]; // as is loaded from global mem.
+    QBuffer q;         // For gmma math. Conversion done if needed.
 
     union ReusedXVOutSwizzleBuf
     {
@@ -191,9 +212,6 @@ struct alignas(128) SharedMem
         return reusedXVOutSwizzleBuf[i].outSwizzle;
     }
 
-    using QBuffer = Vec<Array2D<LdGrain, ctaNbQHeads, grainsPerQPart>, nbQParts>;
-    QBuffer q; // For gmma math. Conversion done if needed.
-
     // @fixme: move these into reusedXVOutSwizzleBuf
 #if SWAP_AB
     ShmQWiseVec xColMax[nbXBuf];
@@ -215,6 +233,11 @@ struct alignas(128) SharedMem
     Vec<KVCachePageIndex, nbPagesPerTile> pages[2]; // one for K and one for V
 #endif
 
+#if SKIP_SOFTMAX_ATTN
+    uint32_t skipSoftmaxVotesGemm0ToV[nbXBuf];     // guarded by skipSoftmaxXBar
+    uint32_t skipSoftmaxVotesGemm0ToGemm1[nbXBuf]; // guarded by xBar
+#endif
+
     // mem barriers
 
     CtaBarrierPair qBar;
@@ -224,6 +247,9 @@ struct alignas(128) SharedMem
     CtaBarrierPair vtBar[nbVBuf];
 #endif
     CtaBarrierPair xBar[nbXBuf];
+#if SKIP_SOFTMAX_ATTN
+    CtaBarrierPair skipSoftmaxXBar[nbXBuf]; // for V to wait for X to be ready
+#endif
 
     // used internally in the gemm0 warp group
     // @fixme: use separate arrive and wait for all usage
@@ -292,9 +318,10 @@ struct KVTilePartLoader
 
     CUtensorMap const& tensorMap;
 #if USE_PAGED_KV_CACHE
-    uint32_t const nbPages; // for bound check
+    uint32_t const nbPages;            // for bound check
+    uint32_t const nbSkipLeadingPages; // pages fully outside the sliding window
     Vec<KVCachePageIndex, nbPagesPerTile>& pages;
-    uint32_t idxTileRef;    // idxTile used to load the pages
+    uint32_t idxTileRef;               // idxTile used to load the pages
 #endif
     uint32_t const baseOffset;
 
@@ -302,7 +329,7 @@ struct KVTilePartLoader
         uint32_t idxReq, uint32_t idxHeadGrp, CUtensorMap const& tensorMap
 #if USE_PAGED_KV_CACHE
         ,
-        uint32_t nbPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
+        uint32_t nbPages, uint32_t nbSkipLeadingPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
 #endif
     );
     // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
@@ -420,8 +447,13 @@ __device__ void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif
 
 #if SWAP_AB
+#if SKIP_SOFTMAX_ATTN
+__device__ RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src,
+    float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool maybeSkip);
+#else
 __device__ RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src);
+#endif
 __device__ void warpGrpApplyMask(uint32_t warpRank, Gemm0Acc& acc, uint32_t validRowBeg, uint32_t validRowEnd);
 __device__ void warpGrpOnlineSoftmax(Gemm0Acc& acc, RegColWiseVec const& colMax);
 __device__ RegColWiseVec computeWarpColSum(Gemm0Acc& src);
@@ -468,32 +500,44 @@ __device__ void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst, Shared
     uint32_t nbKHeads /* only for final result in spec dec. set to 1 for workspace*/, uint32_t ctaNbValidTokens);
 #endif
 
-inline constexpr uint32_t ropeNbPairsPerThrdImpl(uint32_t nbThrds)
+// nbElems is the number of head elements processed as pairs. The RoPE'd q/k path uses the rope region
+// (validRopeElemsPerHead); the V path and non-RoPE q/k path use the full head (validElemsPerHead).
+inline constexpr uint32_t ropeNbPairsPerThrdImpl(uint32_t nbThrds, uint32_t nbElems)
 {
-    auto const val = divUp(exactDiv(validElemsPerHead, 2), nbThrds);
+    auto const val = divUp(exactDiv(nbElems, 2), nbThrds);
     assert(val <= 32);
     return val <= 2 ? val : (val <= 4 ? 4 : (val <= 8 ? 8 : (val <= 16 ? 16 : 32)));
 }
 
-template <uint32_t nbThrds>
-inline constexpr uint32_t ropeNbPairsPerThrd = ropeNbPairsPerThrdImpl(nbThrds);
+template <uint32_t nbThrds, uint32_t nbElems = validElemsPerHead>
+inline constexpr uint32_t ropeNbPairsPerThrd = ropeNbPairsPerThrdImpl(nbThrds, nbElems);
 
-template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem = float>
-__device__ Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds>> loadHead(
-    Vec<SrcElem, validElemsPerHead> const& head, uint32_t tid);
+// nbElems selects how many leading head elements are processed (default: the full head). srcElems is
+// deduced from the argument: the q/k path passes a full head and only the first nbElems are read; the
+// cos/sin path passes an nbElems-sized buffer.
+template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem = float,
+    uint32_t nbElems = validElemsPerHead, uint32_t srcElems = validElemsPerHead>
+__device__ Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>> loadHead(
+    Vec<SrcElem, srcElems> const& head, uint32_t tid);
 template <bool forNeox, uint32_t nbPairsPerThrd>
 __device__ mha::conditional_t<forNeox, Vec<Vec<CacheElem, nbPairsPerThrd>, 2>, Vec<Vec<CacheElem, 2>, nbPairsPerThrd>>
 applyRoPE(Vec<Vec<float, 2>, nbPairsPerThrd> const& data, Vec<Vec<float, 2>, nbPairsPerThrd> const& ropeCosSin);
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems = validElemsPerHead>
 __device__ void storeRotatedPairsForKV(GMemCacheHead& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t tid);
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems = validElemsPerHead>
 __device__ void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t row, uint32_t tid);
+// Partial-rotary helpers: copy the unrotated tail [validRopeElemsPerHead, validElemsPerHead) of a head
+// (no-ops when validRopeElemsPerHead == validElemsPerHead).
+template <uint32_t nbThrds>
+__device__ void storeUnrotatedTailForKV(GMemCacheHead& dst, InputHead const& src, float scale, uint32_t tid);
+template <uint32_t nbThrds>
+__device__ void storeUnrotatedTailForQ(SharedMem::QBuffer& dst, InputHead const& src, uint32_t row, uint32_t tid);
 
 class ScratchMem
 {
@@ -650,7 +694,7 @@ CUBIN_EXPORT __global__
 #if USE_INPUT_KV
             IOHead const* __restrict__ const qkv, // [nbReq][beamWidth][nbQHeads+nbKHeads+nbVHeads],
 #if ROPE_STYLE != 0
-            Vec<float, validElemsPerHead> const* __restrict__ const ropeCosSin, // [maxNbPosEmb]
+            Vec<float, validRopeElemsPerHead> const* __restrict__ const ropeCosSin, // [maxNbPosEmb]
 #endif
 #else
             IOHead const* __restrict__ const q, // [nbReq][beamWidth][nbQHeads],
@@ -670,6 +714,12 @@ CUBIN_EXPORT __global__
 #endif
 #if SPEC_DEC
             SpecDecParams const specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+            float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+            uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
 #endif
             uint32_t* __restrict__ const semaphores
             = nullptr, // [nbReq][nbKHeads][divUp(specDecParams.qSeqLen, inputTokensPerCta)]
@@ -724,6 +774,9 @@ CUBIN_EXPORT __global__
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
 #endif
+#if USE_PAGED_KV_CACHE
+    uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
+#endif
     uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / tileSize;
     uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % tileSize;
 
@@ -748,6 +801,10 @@ CUBIN_EXPORT __global__
     uint32_t const nbSubSeq = isMultiBlockMode ? mha::min(nbTilesInUse / multiBlockMinNbTilesPerCta, maxNbSubSeq) : 1;
     static_assert(multiBlockMinNbTiles >= multiBlockMinNbTilesPerCta * 2);
     assert(isMultiBlockMode == (nbSubSeq > 1));
+#if SKIP_SOFTMAX_ATTN
+    bool const disableSkipForShortSeq = (cacheSeqLen < skipSoftmaxThresholdScaleFactor);
+    float const skipSoftmaxThreshold = disableSkipForShortSeq ? 0.0f : skipSoftmaxThresholdScaleFactor / cacheSeqLen;
+#endif
     if (idxSubSeq >= nbSubSeq)
     {
         return;
@@ -771,21 +828,34 @@ CUBIN_EXPORT __global__
     assert(dynamicSmemSize() >= sizeof(SharedMem));
     SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
-    constexpr uint32_t nbBuffers = 2;
-    static_assert(nbBuffers == SharedMem::nbKBuf && nbBuffers == SharedMem::nbVBuf && nbBuffers == SharedMem::nbXBuf);
-    if (wid < nbBuffers)
+    constexpr uint32_t maxNbBuffers = (SharedMem::nbXBuf > SharedMem::nbVBuf) ? SharedMem::nbXBuf : SharedMem::nbVBuf;
+    static_assert(
+        maxNbBuffers >= SharedMem::nbKBuf && maxNbBuffers >= SharedMem::nbVBuf && maxNbBuffers >= SharedMem::nbXBuf);
+    if (wid < maxNbBuffers)
     {
         if (warpElectSync())
         {
-            smem.kBar[wid].initialize(gemm0NbThrds, gemm0NbThrds + warp_size);
-            smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
-#if !SWAP_AB
-            smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
+            if (wid < SharedMem::nbKBuf)
+            {
+                smem.kBar[wid].initialize(gemm0NbThrds, gemm0NbThrds + warp_size);
+            }
+            if (wid < SharedMem::nbXBuf)
+            {
+#if SKIP_SOFTMAX_ATTN
+                smem.skipSoftmaxXBar[wid].initialize(gemm0NbThrds + warp_size, gemm0NbThrds + warp_size);
+                smem.vBar[wid].initialize(gemm1NbThrds + warp_size, gemm1NbThrds + warp_size);
+#else
+                smem.vBar[wid].initialize(gemm1NbThrds, gemm1NbThrds + warp_size);
 #endif
-            smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
+
+#if !SWAP_AB
+                smem.vtBar[wid].initialize(gemm1NbThrds * 2, gemm1NbThrds * 2);
+#endif
+                smem.xBar[wid].initialize(gemm0NbThrds + gemm1NbThrds, gemm0NbThrds + gemm1NbThrds);
+            }
         }
     }
-    else if (wid == nbBuffers)
+    else if (wid == maxNbBuffers)
     {
         if (warpElectSync())
         {
@@ -812,6 +882,10 @@ CUBIN_EXPORT __global__
     {
 #if SPEC_DEC
         SpecDec const specDec{specDecParams, idxReq, idxInputSubSeq, cacheSeqLen};
+#endif
+
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        uint32_t localSkippedBlockCount = 0;
 #endif
 
         // QK gemm
@@ -935,10 +1009,39 @@ CUBIN_EXPORT __global__
                 }
             }
 #endif
+
+            uint32_t const idxXBuf = idxIter % SharedMem::nbXBuf;
+            auto& xBar = smem.xBar[idxXBuf];
             // update colMax in shared mem and get a register copy
 #if SWAP_AB
+#if SKIP_SOFTMAX_ATTN
+            auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
+            skipSoftmaxXBar.consumed.arrive_and_wait();
+
+            bool const maybeSkip = !disableSkipForShortSeq && idxIter != 0;
+            RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc,
+                skipSoftmaxThreshold, &smem.skipSoftmaxVotesGemm0ToV[idxXBuf], maybeSkip);
+            bool const shouldSkipSoftmaxAttn = static_cast<bool>(smem.skipSoftmaxVotesGemm0ToV[idxXBuf]);
+            unused(skipSoftmaxXBar.produced.arrive());
+            warpGrpOnlineSoftmax(acc, colMax);
+            if (shouldSkipSoftmaxAttn)
+            {
+                xBar.consumed.arrive_and_wait();
+                if (threadIdx.x == 0)
+                {
+                    smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = 1U;
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+                    localSkippedBlockCount++;
+#endif
+                }
+                asm volatile("fence.proxy.async.shared::cta;\n"); // maybe not used
+                unused(xBar.produced.arrive());
+                continue;
+            }
+#else
             RegColWiseVec const colMax = computeWarpGrpColMax_sync(smem.gemm0WarpGrpBar, smem.gemm0CurrentSeqMax, acc);
             warpGrpOnlineSoftmax(acc, colMax);
+#endif
 #else
             RegRowWiseVec const rowMax = computeWarpGrpRowMax_sync(warpRank, smem.gemm0CurrentSeqMax, acc);
             warpGrpOnlineSoftmax(acc, rowMax);
@@ -954,8 +1057,6 @@ CUBIN_EXPORT __global__
             // map 1 to fp8_max before conversion to fp8
             acc = acc * kE4M3_MAX;
 
-            uint32_t const idxXBuf = idxIter % SharedMem::nbXBuf;
-            auto& xBar = smem.xBar[idxXBuf];
             // @fixme: for fp16/bf16, try not to transpose acc here, and leave it to the next GEMM.
 #if SWAP_AB
             storeGemm0AccToShm(warpRank, laneId(), smem.xBuf(idxXBuf), xBar.consumed, acc);
@@ -984,13 +1085,25 @@ CUBIN_EXPORT __global__
             storeShmRowWiseVec(warpRank, smem.xRowMax[idxXBuf], rowMax);
             storeShmRowWiseVec(warpRank, smem.xRowSum[idxXBuf], rowSum);
 #endif
-
+#if SKIP_SOFTMAX_ATTN
+            if (threadIdx.x == 0)
+            {
+                smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf] = 0;
+            }
+#endif
             __syncwarp();
             // the release semantics of arrive does not work for async consumers like gmma. additional fence is
             // needed.
             asm volatile("fence.proxy.async.shared::cta;\n");
             unused(xBar.produced.arrive());
         }
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        if (threadIdx.x == 0 && skippedBlockCount != nullptr && totalBlockCount != nullptr)
+        {
+            atomicAdd(skippedBlockCount, localSkippedBlockCount);
+            atomicAdd(totalBlockCount, nbIters);
+        }
+#endif
         unused(smem.qBar.consumed.arrive());
     }
     else if (warpIdx.z == 1)
@@ -1038,216 +1151,233 @@ CUBIN_EXPORT __global__
             uint32_t idxVTile = idxVTileInit + idxIter * nbSubSeq;
             auto const idxVBuf = idxIter % SharedMem::nbVBuf;
             auto const idxXBuf = idxVBuf;
+            auto& xBar = smem.xBar[idxXBuf];
             auto& vBar = smem.vBar[idxVBuf];
-            arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
             auto const& vBuf = smem.vBuf(idxVBuf);
 #if !SWAP_AB
             CtaBarrierPair& vtBar = smem.vtBar[idxVBuf];
             auto& vtBuf = smem.vtBuf(idxVBuf);
-            vtBar.consumed.arrive_and_wait();
-            transposeVTile(warpRank, laneId(), vtBuf, vBuf);
-            vBar.consumed.arrive();
-            vtBar.produced.arrive();
 #endif
-            auto& xBar = smem.xBar[idxXBuf];
             xBar.produced.arrive_and_wait();
+#if SKIP_SOFTMAX_ATTN
+            bool shouldSkipSoftmaxAttn = smem.skipSoftmaxVotesGemm0ToGemm1[idxXBuf]; // guarded by xBar
+            if (shouldSkipSoftmaxAttn)
+            {
+                vBar.produced.arrive_and_wait();
+            }
+#endif
+
+#if SKIP_SOFTMAX_ATTN
+            if (!shouldSkipSoftmaxAttn) // skip XVGemm
+#endif
+            {
+                arrive_tx_and_wait(vBar.produced, exactDiv(sizeof(SharedMem::VBuffer), gemm1NbThrds));
+#if !SWAP_AB
+                vtBar.consumed.arrive_and_wait();
+                transposeVTile(warpRank, laneId(), vtBuf, vBuf);
+                vBar.consumed.arrive();
+                vtBar.produced.arrive();
+#endif
 #if !defined(NDEBUG) && DBG_PRINT
 #if SWAP_AB
-            if (threadIdx.x == 0)
-            {
-                printf("colMax:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
+                if (threadIdx.x == 0)
                 {
-                    printf("%f, ", smem.xColMax[idxXBuf][i]);
-                }
-                printf("\n");
-                printf("colSum:\n");
-                for (int n = 0; n < 4; n++)
-                {
+                    printf("colMax:\n");
                     for (int i = 0; i < ctaNbQHeads; i++)
                     {
-                        printf("%f, ", smem.xColSum[idxXBuf][n][i]);
+                        printf("%f, ", smem.xColMax[idxXBuf][i]);
+                    }
+                    printf("\n");
+                    printf("colSum:\n");
+                    for (int n = 0; n < 4; n++)
+                    {
+                        for (int i = 0; i < ctaNbQHeads; i++)
+                        {
+                            printf("%f, ", smem.xColSum[idxXBuf][n][i]);
+                        }
+                        printf("\n");
+                    }
+                    printf("\n");
+                    printf("X:\n");
+                    for (int i = 0; i < ctaNbQHeads; i++)
+                    {
+                        for (int j = 0; j < gemm0CtaTileNbTokens; j++)
+                        {
+                            auto const& elemsPerXPart = (cacheElemsPerGrain * grainsPerXPart);
+                            auto const e = reinterpret_cast<Vec<__nv_fp8_e4m3, 16>&>(
+                                smem.xBuf(idxXBuf)[j / elemsPerXPart].template at<true>(
+                                    i, j % elemsPerXPart / cacheElemsPerGrain))[j % cacheElemsPerGrain];
+                            printf("%.2f, ", float(e));
+                            if (j % 16 == 15)
+                            {
+                                printf("| ");
+                            }
+                        }
+                        printf("\n\n");
+                    }
+                }
+                smem.gemm1WarpGrpBar.arrive_and_wait();
+#else
+                if (blockIdx.y == 1 && threadIdx.x == 0)
+                {
+                    printf("rowMax:\n");
+                    for (int i = 0; i < ctaNbQHeads; i++)
+                    {
+                        printf("%f, ", smem.xRowMax[idxXBuf][i]);
+                    }
+                    printf("\n");
+                    printf("rowSum:\n");
+                    for (int i = 0; i < ctaNbQHeads; i++)
+                    {
+                        printf("%f, ", smem.xRowSum[idxXBuf][i]);
                     }
                     printf("\n");
                 }
-                printf("\n");
-                printf("X:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
-                {
-                    for (int j = 0; j < gemm0CtaTileNbTokens; j++)
-                    {
-                        auto const& elemsPerXPart = (cacheElemsPerGrain * grainsPerXPart);
-                        auto const e = reinterpret_cast<Vec<__nv_fp8_e4m3, 16>&>(
-                            smem.xBuf(idxXBuf)[j / elemsPerXPart].template at<true>(
-                                i, j % elemsPerXPart / cacheElemsPerGrain))[j % cacheElemsPerGrain];
-                        printf("%.2f, ", float(e));
-                        if (j % 16 == 15)
-                        {
-                            printf("| ");
-                        }
-                    }
-                    printf("\n\n");
-                }
-            }
-            smem.gemm1WarpGrpBar.arrive_and_wait();
-#else
-            if (blockIdx.y == 1 && threadIdx.x == 0)
-            {
-                printf("rowMax:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
-                {
-                    printf("%f, ", smem.xRowMax[idxXBuf][i]);
-                }
-                printf("\n");
-                printf("rowSum:\n");
-                for (int i = 0; i < ctaNbQHeads; i++)
-                {
-                    printf("%f, ", smem.xRowSum[idxXBuf][i]);
-                }
-                printf("\n");
-            }
-            smem.gemm1WarpGrpBar.arrive_and_wait();
+                smem.gemm1WarpGrpBar.arrive_and_wait();
 #endif
 #endif
 
 #if SWAP_AB
-            // @fixme: if first tile, no need to rescale acc. For persistent CTA, just re-initialize acc instead.
-            rescaleGemm1AccForNewColMax_sync(warpRank, smem.xColMax[idxXBuf], smem.xColSum[idxXBuf],
-                smem.gemm1AccColMax, acc, smem.gemm1AccColSum, smem.gemm1WarpGrpBar);
+                // @fixme: if first tile, no need to rescale acc. For persistent CTA, just re-initialize acc instead.
+                rescaleGemm1AccForNewColMax_sync(warpRank, smem.xColMax[idxXBuf], smem.xColSum[idxXBuf],
+                    smem.gemm1AccColMax, acc, smem.gemm1AccColSum, smem.gemm1WarpGrpBar);
 #else
-            rescaleGemm1AccForNewRowMax_sync(
-                warpRank, smem.xRowMax[idxXBuf], smem.xRowSum[idxXBuf], smem.gemm1AccColMax, acc, smem.gemm1AccColSum);
+                rescaleGemm1AccForNewRowMax_sync(warpRank, smem.xRowMax[idxXBuf], smem.xRowSum[idxXBuf],
+                    smem.gemm1AccColMax, acc, smem.gemm1AccColSum);
 #endif
-            auto& xBuf = smem.xBuf(idxXBuf);
+                auto& xBuf = smem.xBuf(idxXBuf);
 
-            auto const descXBase = gmma::makeMatDesc(nullptr, 0, SharedMem::XBuffer::Elem::rowBytes * 8,
-                gmma::getSwizzleMode<true>(SharedMem::XBuffer::Elem{}))
-                                       .raw();
+                auto const descXBase = gmma::makeMatDesc(nullptr, 0, SharedMem::XBuffer::Elem::rowBytes * 8,
+                    gmma::getSwizzleMode<true>(SharedMem::XBuffer::Elem{}))
+                                           .raw();
 #if CACHE_ELEM_ENUM == 0
-            auto const descVBase = gmma::makeMatDesc(nullptr, 0, SharedMem::VBuffer::Elem::rowBytes * 8,
-                gmma::getSwizzleMode<true>(SharedMem::VBuffer::Elem{}))
-                                       .raw();
+                auto const descVBase = gmma::makeMatDesc(nullptr, 0, SharedMem::VBuffer::Elem::rowBytes * 8,
+                    gmma::getSwizzleMode<true>(SharedMem::VBuffer::Elem{}))
+                                           .raw();
 #endif
 #if SWAP_AB
 //@fixme: to reduce code size, we can disable unroll and use double-buffer for LDSM in loadVTileTransposed.
 #pragma unroll
-            for (uint32_t idxInstK = 0; idxInstK < gemm1NbGmmaInstK; idxInstK++)
-            {
+                for (uint32_t idxInstK = 0; idxInstK < gemm1NbGmmaInstK; idxInstK++)
+                {
 #if CACHE_ELEM_ENUM == 2
-                Vec<RegMatAFrag, gemm1NbGmmaInstM> const fragA
-                    = loadVTileTransposed(warpRank, laneId(), vBuf, idxInstK);
+                    Vec<RegMatAFrag, gemm1NbGmmaInstM> const fragA
+                        = loadVTileTransposed(warpRank, laneId(), vBuf, idxInstK);
 #if !defined(NDEBUG) && DBG_PRINT
-                if (threadIdx.x == 0)
-                {
-                    printf("fragA:\nidxInstK == %u\n", idxInstK);
-                }
-                smem.gemm1WarpGrpBar.arrive_and_wait();
-                for (int m = 0; m < 2; m++)
-                {
-                    for (int w = 0; w < 4; w++)
+                    if (threadIdx.x == 0)
                     {
-                        if (warpRank == w)
+                        printf("fragA:\nidxInstK == %u\n", idxInstK);
+                    }
+                    smem.gemm1WarpGrpBar.arrive_and_wait();
+                    for (int m = 0; m < 2; m++)
+                    {
+                        for (int w = 0; w < 4; w++)
                         {
-                            if (laneId() == 0)
+                            if (warpRank == w)
                             {
-                                printf("    warpRank = %u\n", warpRank);
-                            }
-                            __syncwarp();
-                            for (int a = 0; a < 2; a++)
-                            {
-                                for (int b = 0; b < 8; b++)
+                                if (laneId() == 0)
                                 {
-                                    for (int c = 0; c < 2; c++)
+                                    printf("    warpRank = %u\n", warpRank);
+                                }
+                                __syncwarp();
+                                for (int a = 0; a < 2; a++)
+                                {
+                                    for (int b = 0; b < 8; b++)
                                     {
-                                        for (int d = 0; d < 4; d++)
+                                        for (int c = 0; c < 2; c++)
                                         {
-                                            if (laneId() == b * 4 + d)
+                                            for (int d = 0; d < 4; d++)
                                             {
-                                                for (int e = 0; e < 4; e++)
+                                                if (laneId() == b * 4 + d)
                                                 {
-                                                    auto const& elem4 = reinterpret_cast<__nv_fp8_e4m3 const(&)[4]>(
-                                                        fragA[m](0, c)(a, 0));
-                                                    printf("%.2f, ", float(elem4[e]));
+                                                    for (int e = 0; e < 4; e++)
+                                                    {
+                                                        auto const& elem4 = reinterpret_cast<__nv_fp8_e4m3 const(&)[4]>(
+                                                            fragA[m](0, c)(a, 0));
+                                                        printf("%.2f, ", float(elem4[e]));
+                                                    }
                                                 }
+                                                __syncwarp();
                                             }
-                                            __syncwarp();
                                         }
+                                        if (laneId() == 0)
+                                        {
+                                            printf("\n");
+                                        }
+                                        __syncwarp();
                                     }
-                                    if (laneId() == 0)
+                                    if (laneId() == 0 && a == 0)
                                     {
-                                        printf("\n");
+                                        printf("----------------------\n");
                                     }
                                     __syncwarp();
                                 }
-                                if (laneId() == 0 && a == 0)
-                                {
-                                    printf("----------------------\n");
-                                }
-                                __syncwarp();
                             }
+                            smem.gemm1WarpGrpBar.arrive_and_wait();
                         }
-                        smem.gemm1WarpGrpBar.arrive_and_wait();
                     }
-                }
 #endif
 #endif
-                BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * idxInstK};
-                auto const descX = addAddr(descXBase,
-                    &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
-                        0, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
+                    BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * idxInstK};
+                    auto const descX = addAddr(descXBase,
+                        &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
+                            0, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
 #if CACHE_ELEM_ENUM == 2
-                gmma::fence();
+                    gmma::fence();
 #endif
 #pragma unroll
-                for (uint32_t idxInstM = 0; idxInstM < gemm1NbGmmaInstM; idxInstM++)
-                {
+                    for (uint32_t idxInstM = 0; idxInstM < gemm1NbGmmaInstM; idxInstM++)
+                    {
 #if CACHE_ELEM_ENUM == 0
-                    auto const descV
-                        = addAddr(descVBase, &vBuf[idxInstM](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
-                    gmma::mma_async_shmA<MathElem, ctaNbQHeads, true, false>(
-                        reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
-                        descV, descX, true);
+                        auto const descV
+                            = addAddr(descVBase, &vBuf[idxInstM](kOffsetInGrains.get() * cacheElemsPerGrain, 0));
+                        gmma::mma_async_shmA<MathElem, ctaNbQHeads, true, false>(
+                            reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
+                            descV, descX, true);
 #elif CACHE_ELEM_ENUM == 2
-                    gmma::mma_async_regA<MathElem, ctaNbQHeads>(
-                        reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
-                        reinterpret_cast<uint32_t const(&)[2][2][1]>(fragA[idxInstM]), descX, true);
+                        gmma::mma_async_regA<MathElem, ctaNbQHeads>(
+                            reinterpret_cast<float(&)[exactDiv(ctaNbQHeads, gmma::instNBase)][2][2]>(acc(idxInstM, 0)),
+                            reinterpret_cast<uint32_t const(&)[2][2][1]>(fragA[idxInstM]), descX, true);
 #endif
+                    }
+                    gmma::commit_group();
+                    //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of
+                    // gmma.
+                    gmma::wait_group<0>();
                 }
-                gmma::commit_group();
-                //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of
-                // gmma.
-                gmma::wait_group<0>();
-            }
 #else
-            auto const descVTBase = gmma::makeMatDesc(
-                nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
-                                        .raw();
-            vtBar.produced.arrive_and_wait();
+                auto const descVTBase = gmma::makeMatDesc(
+                    nullptr, 0, SharedMem::VTBuffer::rowBytes * 8, gmma::getSwizzleMode<true>(SharedMem::VTBuffer{}))
+                                            .raw();
+                vtBar.produced.arrive_and_wait();
 // if (idxIter == 1 && threadIdx.x == 0) {
 //     printf("vtBuf:\n");
 //     dbg::printArray2D<__nv_fp8_e4m3, true>(vtBuf);
 // }
 #pragma unroll
-            for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
-            {
-#pragma unroll
-                for (uint32_t k = 0; k < gemm1NbGmmaInstK; k++)
+                for (uint32_t m = 0; m < Gemm1Acc::rows; m++)
                 {
-                    BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * k};
-                    auto const descX = addAddr(descXBase,
-                        &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
-                            gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
-                    auto const descVT = addAddr(
-                        descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
-                    gmma::mma_async_shmA<MathElem, headElems>(
-                        reinterpret_cast<float(&)[exactDiv(headElems, gmma::instNBase)][2][2]>(acc(m, 0)), descX,
-                        descVT, true);
+#pragma unroll
+                    for (uint32_t k = 0; k < gemm1NbGmmaInstK; k++)
+                    {
+                        BoundedVal<grainsPerInstK * gemm1NbGmmaInstK> const kOffsetInGrains{grainsPerInstK * k};
+                        auto const descX = addAddr(descXBase,
+                            &xBuf[kOffsetInGrains.template divBy<SharedMem::XBuffer::Elem::cols>().get()](
+                                gmma::instM * m, kOffsetInGrains.template mod<SharedMem::XBuffer::Elem::cols>().get()));
+                        auto const descVT = addAddr(
+                            descVTBase, &vtBuf(0, kOffsetInGrains.template mod<SharedMem::VTBuffer::cols>().get()));
+                        gmma::mma_async_shmA<MathElem, headElems>(
+                            reinterpret_cast<float(&)[exactDiv(headElems, gmma::instNBase)][2][2]>(acc(m, 0)), descX,
+                            descVT, true);
+                    }
                 }
-            }
-            gmma::commit_group();
-            //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of gmma.
-            gmma::wait_group<0>();
+                gmma::commit_group();
+                //@fixme: delay wait and consumption to next tile. Note that fragA must also persist until finish of
+                // gmma.
+                gmma::wait_group<0>();
 #endif
+            }
+
             if (idxIter == nbIters - 1)
             {
                 // gmma::wait_group should have already synchronized threads, so this may be unnecessary.
@@ -1339,8 +1469,9 @@ CUBIN_EXPORT __global__
             smem.qBar.consumed.arrive_and_wait();
 #if ROPE_STYLE != 0
             auto const& ropeCosSinHead
-                = reinterpret_cast<Vec<float, validElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
-            auto const cosSinPairs = loadHead<float, false, thrdsPerHead>(ropeCosSinHead, tid);
+                = reinterpret_cast<Vec<float, validRopeElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
+            auto const cosSinPairs
+                = loadHead<float, false, thrdsPerHead, float, validRopeElemsPerHead>(ropeCosSinHead, tid);
 #endif
 #if ENABLE_PDL == 2
             acqBulk();
@@ -1356,10 +1487,17 @@ CUBIN_EXPORT __global__
 #if ROPE_STYLE == 0
                 auto const rotatedPairs = loadHead<InputElem, isNeox, thrdsPerHead, MathElem>(qData[idxHead], tid);
 #else
-                auto const pairs = loadHead<InputElem, isNeox, thrdsPerHead>(qData[idxHead], tid);
+                auto const pairs
+                    = loadHead<InputElem, isNeox, thrdsPerHead, float, validRopeElemsPerHead>(qData[idxHead], tid);
                 auto const rotatedPairs = applyRoPE<isNeox>(pairs, cosSinPairs);
 #endif
-                storeRotatedPairsForQ<isNeox, thrdsPerHead>(smem.q, rotatedPairs, idxHead, tid);
+                // nbElems == validRopeElemsPerHead for the rope region; for ROPE_STYLE == 0 this equals
+                // validElemsPerHead (full head), matching the loadHead above.
+                storeRotatedPairsForQ<isNeox, thrdsPerHead, validRopeElemsPerHead>(smem.q, rotatedPairs, idxHead, tid);
+#if ROPE_STYLE != 0
+                // Partial rotary: copy the unrotated tail of the head (no-op for full rotary).
+                storeUnrotatedTailForQ<thrdsPerHead>(smem.q, qData[idxHead], idxHead, tid);
+#endif
             }
 #else
             TinyPtr<IOHead const> const qData{q, headGrpSize * (nbKHeads * (beamWidth * ctaInputTokBeg) + idxHeadGrp)};
@@ -1387,7 +1525,7 @@ CUBIN_EXPORT __global__
 #else
                     tensorMap,
 #endif
-                    nbPages, smem.pages[0]
+                    nbPages, nbSkipLeadingPages, smem.pages[0]
 #else
                     tensorMap
 #endif
@@ -1425,12 +1563,18 @@ CUBIN_EXPORT __global__
                         kTilePartLoader.getHead(newTokenPos), convertedPairs, lane);
 #else
                     constexpr bool isNeox = (ROPE_STYLE == 1);
-                    auto const pairs = loadHead<InputElem, isNeox, warp_size>(inKHead, lane) * rcpKScale;
+                    auto const pairs
+                        = loadHead<InputElem, isNeox, warp_size, float, validRopeElemsPerHead>(inKHead, lane)
+                        * rcpKScale;
                     auto const& ropeCosSinHead
-                        = reinterpret_cast<Vec<float, validElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
-                    auto const cosSinPairs = loadHead<float, false, warp_size>(ropeCosSinHead, lane);
+                        = reinterpret_cast<Vec<float, validRopeElemsPerHead> const&>(ropeCosSin[cacheSeqLen - 1]);
+                    auto const cosSinPairs
+                        = loadHead<float, false, warp_size, float, validRopeElemsPerHead>(ropeCosSinHead, lane);
                     auto const rotatedPairs = applyRoPE<isNeox>(pairs, cosSinPairs);
-                    storeRotatedPairsForKV<isNeox, warp_size>(kTilePartLoader.getHead(newTokenPos), rotatedPairs, lane);
+                    storeRotatedPairsForKV<isNeox, warp_size, validRopeElemsPerHead>(
+                        kTilePartLoader.getHead(newTokenPos), rotatedPairs, lane);
+                    // Partial rotary: copy the unrotated tail of the head (no-op for full rotary).
+                    storeUnrotatedTailForKV<warp_size>(kTilePartLoader.getHead(newTokenPos), inKHead, rcpKScale, lane);
 #endif
                     static_assert(inputSeqLen == 1);
                     __syncwarp();
@@ -1461,13 +1605,29 @@ CUBIN_EXPORT __global__
 #else
                     tensorMap,
 #endif
-                    nbPages, smem.pages[1]
+                    nbPages, nbSkipLeadingPages, smem.pages[1]
 #else
                     tensorMap
 #endif
             };
+#if SKIP_SOFTMAX_ATTN
+            for (auto& b : smem.skipSoftmaxXBar)
+            {
+                unused(b.consumed.arrive());
+            }
+#endif
             for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++)
             {
+                uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
+                auto& vBar = smem.vBar[idxVBuf];
+#if SKIP_SOFTMAX_ATTN
+                uint32_t idxXBuf = idxIter % SharedMem::nbXBuf;
+                auto& skipSoftmaxXBar = smem.skipSoftmaxXBar[idxXBuf];
+                skipSoftmaxXBar.produced.arrive_and_wait();
+                bool shouldSkipSoftmaxAttn = smem.skipSoftmaxVotesGemm0ToV[idxXBuf];
+                skipSoftmaxXBar.consumed.arrive();
+#endif
+
                 uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
                 vTileLoader.loadPages(idxVTile);
 #if USE_INPUT_KV || ENABLE_PDL == 2
@@ -1501,8 +1661,20 @@ CUBIN_EXPORT __global__
                 }
 #endif
 
-                uint32_t const idxVBuf = idxIter % SharedMem::nbVBuf;
-                auto& vBar = smem.vBar[idxVBuf];
+#if SKIP_SOFTMAX_ATTN
+                if (shouldSkipSoftmaxAttn)
+                {
+                    vBar.consumed.arrive_and_wait();
+                    // compared to non-skip softmax attn, we need to increase vBar.produced count to avoid race
+                    // condition where vBar.consumed is arrived again without wait without skip softmax attn, XVGemm
+                    // will wait for tx_count, so its progress won't go ahead of vload warp with skip softmax attn,
+                    // XVGemm WG may go ahead of vload warp, as previous vBar only have XVGemm WG threads and a tx_count
+                    // (now = 0). Then it may arrive vBar.consumed before it is arrive_and_wait-ed
+                    vBar.produced.arrive();
+                    continue;
+                }
+#endif
+
                 vBar.consumed.arrive_and_wait();
                 if (warpElectSync())
                 {
@@ -1512,6 +1684,9 @@ CUBIN_EXPORT __global__
                         vTileLoader.loadData(smem.vBuf(idxVBuf)[idxPart], idxVTile, idxPart, vBar.produced);
                     }
                 }
+#if SKIP_SOFTMAX_ATTN
+                vBar.produced.arrive();
+#endif
                 __syncwarp();
             }
         }
@@ -1726,7 +1901,7 @@ CUBIN_EXPORT __global__
     }
 #else
 #if GENERATE_CUBIN
-    static_assert("This kernel is for Hopper only");
+    static_assert(false, "This kernel is for Hopper only");
 #else
     asm volatile("trap;\n");
 #endif
@@ -1825,7 +2000,7 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads
     KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq, uint32_t idxHeadGrp, CUtensorMap const& tensorMap
 #if USE_PAGED_KV_CACHE
     ,
-    uint32_t nbPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
+    uint32_t nbPages, uint32_t nbSkipLeadingPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
 #endif
     )
     : nbKHeads{nbKHeads}
@@ -1835,6 +2010,7 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads
     , tensorMap{tensorMap}
 #if USE_PAGED_KV_CACHE
     , nbPages{nbPages}
+    , nbSkipLeadingPages{nbSkipLeadingPages}
     , pages{pageBuf}
 #if PAGED_KV_CACHE_LAYOUT == 1
     , baseOffset{idxReq * cacheList.maxNbPagesPerSeq}
@@ -1895,7 +2071,9 @@ __device__ inline void KVTilePartLoader::loadPages(uint32_t idxTile)
     for (uint32_t i = 0; i < nbPagesPerTile; i++)
     {
         uint32_t const idxPage = idxPageBeg + i;
-        auto const page = idxPage < nbPages ? cacheList.kvCachePageList[baseOffset + idxPage] : kBAD_PAGE_INDEX;
+        auto const page = (idxPage >= nbSkipLeadingPages && idxPage < nbPages)
+            ? cacheList.kvCachePageList[baseOffset + idxPage]
+            : kBAD_PAGE_INDEX;
         if (warpElectSync())
         {
             pages[i] = page;
@@ -1987,9 +2165,23 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif // SPEC_DEC
 
 // smemColMax is persistent across multiple iterations
+#if SKIP_SOFTMAX_ATTN
+__device__ inline RegColWiseVec computeWarpGrpColMax_sync(CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax,
+    Gemm0Acc const& src, float skipSoftmaxThreshold, uint32_t* smemSkipVote, bool maybeSkip)
+#else
 __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     CtaBarrier& warpGrpBar, ShmQWiseVec& smemColMax, Gemm0Acc const& src)
+#endif
 {
+#if SKIP_SOFTMAX_ATTN
+    if (threadIdx.x == 0)
+    {
+        *smemSkipVote = maybeSkip ? 1U : 0U; // will sync before vote
+    }
+    float const lnThreshold
+        = log(skipSoftmaxThreshold); // this can be -inf, but should be safe as we only use it for comparison
+#endif
+
     auto colMax = RegColWiseVec::filled(Vec<float, 2>::filled(safeInitRowMax));
 #pragma unroll
     for (uint32_t n = 0; n < src.cols; n++)
@@ -2024,6 +2216,9 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
     }
 
     uint32_t const lane = laneId();
+#if SKIP_SOFTMAX_ATTN
+    auto prevOrCurrentMax = RegColWiseVec();
+#if SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE
     if (lane < 4)
     {
 #pragma unroll
@@ -2032,12 +2227,43 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
 #pragma unroll
             for (uint32_t j = 0; j < 2; j++)
             {
-                atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+                prevOrCurrentMax[n][j] = smemColMax[8 * n + 2 * lane + j];
             }
         }
     }
     warpGrpBar.arrive_and_wait();
+#endif
+#endif
+
+    if (lane < 4)
+    {
+#pragma unroll
+        for (uint32_t n = 0; n < src.cols; n++)
+        {
+#pragma unroll
+            for (uint32_t j = 0; j < 2; j++)
+            {
+#if SKIP_SOFTMAX_ATTN && !SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE
+                // prevOrCurrentMax <= actual smemColMax (after updates from all 4 warps done), but always >=
+                // smemColMax(Prev), the smemColMax value *before* this tile is computed.
+                // When determine whether to skip, it is safe to use prevOrCurrentMax: 1) all 4 warps' localmax <
+                // smemColMax(Prev), then prevOrCurrentMax == smemColMax(Prev), result not affected; 2) if some localmax
+                // > smemColMax(Prev), prevOrCurrentMax > smemColMax(Prev), some warps may incorrectly vote skip, but
+                // at least one warp whose localColMax is larger will not skip, then the tile is not skipped.
+                // This reduces some sync and check, but has issue when threshold > 1.
+                prevOrCurrentMax[n][j] = atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+#else
+                atomicMax(&smemColMax[8 * n + 2 * lane + j], colMax[n][j]);
+#endif
+            }
+        }
+    }
+    warpGrpBar.arrive_and_wait();
+
     uint32_t const idxInQuad = lane % 4;
+#if SKIP_SOFTMAX_ATTN
+    bool localShouldSkip = true;
+#endif
 
 #pragma unroll
     for (uint32_t n = 0; n < src.cols; n++)
@@ -2045,10 +2271,21 @@ __device__ inline RegColWiseVec computeWarpGrpColMax_sync(
 #pragma unroll
         for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
         {
+#if SKIP_SOFTMAX_ATTN
+            if (lane < 4 && 8 * n + 2 * idxInQuad + j < headGrpSize)
+            {
+                localShouldSkip &= (colMax[n][j] - prevOrCurrentMax[n][j]) < lnThreshold;
+            }
+#endif
             assert(colMax[n][j] <= smemColMax[8 * n + 2 * idxInQuad + j]);
             colMax[n][j] = smemColMax[8 * n + 2 * idxInQuad + j];
         }
     }
+
+#if SKIP_SOFTMAX_ATTN
+    atomicAnd(smemSkipVote, static_cast<uint32_t>(localShouldSkip)); // this will be translated to redux and voteu
+#endif
+
     warpGrpBar.arrive_and_wait();
     return colMax;
 }
@@ -2078,9 +2315,13 @@ __device__ inline RegColWiseVec loadGmemColWiseVecWithDup(ShmQWiseVec const& gme
     for (uint32_t i = 0; i < exactDiv(ShmQWiseVec::size, gmma::instNBase); i++)
     {
         static_assert(nbThrdsPerInstNBase * RegColWiseVec::size == exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols));
-        ret[i] = reinterpret_cast<
-            Vec<Vec<float, GmmaAccCoreMat::cols>, exactDiv(ShmQWiseVec::size, GmmaAccCoreMat::cols)> const&>(
-            gmemVec)[mha::min(i * nbThrdsPerInstNBase + idx, bound)];
+        uint32_t const clampedIdx = mha::min(i * nbThrdsPerInstNBase + idx, bound);
+        uint32_t const baseOffset = clampedIdx * GmmaAccCoreMat::cols;
+#pragma unroll
+        for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++)
+        {
+            ret[i][j] = gmemVec[baseOffset + j];
+        }
     }
     return ret;
 }
@@ -2190,7 +2431,7 @@ __device__ inline void storeGemm0AccToShm(
     uint32_t const idxOctInsideHalf = idxInHalf / 8;
     uint32_t const idxRowInsideOct = lane % 8;
     uint32_t const warpBaseC = 16 * warpRank;
-    auto const toAccCoords = [](uint32_t const idxAccCoreMat) -> std::pair<uint32_t, uint32_t>
+    auto const toAccCoords = [](uint32_t const idxAccCoreMat) -> mha::pair<uint32_t, uint32_t>
     {
         uint32_t const accR = idxAccCoreMat / Gemm0Acc::cols;
         uint32_t const accC = idxAccCoreMat % Gemm0Acc::cols;
@@ -3050,12 +3291,15 @@ __device__ inline void finalizeAndWriteOut_sync(uint32_t warpRank, DstHead* dst,
 }
 #endif
 
-template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem>
-__device__ inline Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds>> loadHead(
-    Vec<SrcElem, validElemsPerHead> const& head, uint32_t tid)
+template <typename SrcElem, bool forNeox, uint32_t nbThrds, typename DstElem, uint32_t nbElems, uint32_t srcElems>
+__device__ inline Vec<Vec<DstElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>> loadHead(
+    Vec<SrcElem, srcElems> const& head, uint32_t tid)
 {
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds>;
+    // Only the first nbElems elements are loaded; for NEOX the two halves sit at [0, nbElems/2) and
+    // [nbElems/2, nbElems). For the RoPE'd path nbElems == validRopeElemsPerHead (the rope region).
+    constexpr uint32_t nbPairs = exactDiv(nbElems, 2);
+    static_assert(srcElems >= nbElems);
+    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds, nbElems>;
     constexpr uint32_t nbWorkingThrds = exactDiv(nbPairs, nbPairsPerThrd);
     bool const isWorkingThrd = (nbWorkingThrds == nbThrds || tid < nbWorkingThrds);
     static_assert(nbPairs % nbPairsPerThrd == 0);
@@ -3124,14 +3368,14 @@ applyRoPE(Vec<Vec<float, 2>, nbPairsPerThrd> const& data, Vec<Vec<float, 2>, nbP
     }
 }
 
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems>
 __device__ inline void storeRotatedPairsForKV(GMemCacheHead& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t tid)
 {
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds>;
+    constexpr uint32_t nbPairs = exactDiv(nbElems, 2);
+    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds, nbElems>;
     constexpr uint32_t nbWorkingThrds = exactDiv(nbPairs, nbPairsPerThrd);
     bool const isWorkingThrd = (nbWorkingThrds == nbThrds || tid < nbWorkingThrds);
     static_assert(nbPairs % nbPairsPerThrd == 0);
@@ -3151,14 +3395,14 @@ __device__ inline void storeRotatedPairsForKV(GMemCacheHead& dst,
     }
 }
 
-template <bool forNeox, uint32_t nbThrds>
+template <bool forNeox, uint32_t nbThrds, uint32_t nbElems>
 __device__ inline void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
-    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds>>, 2>,
-        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds>>> const& src,
+    mha::conditional_t<forNeox, Vec<Vec<CacheElem, ropeNbPairsPerThrd<nbThrds, nbElems>>, 2>,
+        Vec<Vec<CacheElem, 2>, ropeNbPairsPerThrd<nbThrds, nbElems>>> const& src,
     uint32_t row, uint32_t tid)
 {
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds>;
+    constexpr uint32_t nbPairs = exactDiv(nbElems, 2);
+    constexpr uint32_t nbPairsPerThrd = ropeNbPairsPerThrd<nbThrds, nbElems>;
     constexpr uint32_t nbWorkingThrds = exactDiv(nbPairs, nbPairsPerThrd);
     bool const isWorkingThrd = (nbWorkingThrds == nbThrds || tid < nbWorkingThrds);
     static_assert(nbPairs % nbPairsPerThrd == 0);
@@ -3221,7 +3465,77 @@ __device__ inline void storeRotatedPairsForQ(SharedMem::QBuffer& dst,
     }
 }
 
+// Copy the unrotated tail [validRopeElemsPerHead, validElemsPerHead) of a head into the (linear) K
+// cache, converting InputElem -> CacheElem and applying the kv-cache scale. No-op for full rotary.
+template <uint32_t nbThrds>
+__device__ inline void storeUnrotatedTailForKV(GMemCacheHead& dst, InputHead const& src, float scale, uint32_t tid)
+{
+    if constexpr (validRopeElemsPerHead < validElemsPerHead)
+    {
+        constexpr uint32_t tailElems = validElemsPerHead - validRopeElemsPerHead;
+        constexpr uint32_t nbIters = divUp(tailElems, nbThrds);
+#pragma unroll
+        for (uint32_t iter = 0; iter < nbIters; iter++)
+        {
+            uint32_t const e = validRopeElemsPerHead + tid + iter * nbThrds;
+            if (e >= validElemsPerHead)
+            {
+                break;
+            }
+            dst[e] = convert<CacheElem>(Vec<float, 1>{float(src[e]) * scale})[0];
+        }
+    }
+}
+
+// Copy the unrotated tail [validRopeElemsPerHead, validElemsPerHead) of a head into the swizzled Q
+// shared-memory buffer, converting InputElem -> CacheElem. Mirrors the byte->(part,grain) mapping in
+// storeRotatedPairsForQ so the GMMA sees a contiguous head. No-op for full rotary.
+template <uint32_t nbThrds>
+__device__ inline void storeUnrotatedTailForQ(SharedMem::QBuffer& dst, InputHead const& src, uint32_t row, uint32_t tid)
+{
+    if constexpr (validRopeElemsPerHead < validElemsPerHead)
+    {
+        constexpr uint32_t tailElems = validElemsPerHead - validRopeElemsPerHead;
+        constexpr uint32_t nbIters = divUp(tailElems, nbThrds);
+#pragma unroll
+        for (uint32_t iter = 0; iter < nbIters; iter++)
+        {
+            uint32_t const e = validRopeElemsPerHead + tid + iter * nbThrds;
+            if (e >= validElemsPerHead)
+            {
+                break;
+            }
+            CacheElem const val = convert<CacheElem>(Vec<float, 1>{float(src[e])})[0];
+            auto const byteOffset = BoundedVal<mathHeadBytes>{cacheElemSize * e};
+            uint32_t const idxPart = byteOffset.template divBy<qPartBytes>().get();
+            auto const byteOffsetInsidePart = byteOffset.template mod<qPartBytes>();
+            uint32_t const idxGrain = byteOffsetInsidePart.template divBy<grainBytes>().get();
+            uint32_t const byteOffsetInsideGrain = byteOffsetInsidePart.template mod<grainBytes>().get();
+            LdGrain& grain = dst[idxPart].template at<true>(row, idxGrain);
+            reinterpret_cast<CacheElem*>(reinterpret_cast<mha::byte*>(&grain) + byteOffsetInsideGrain)[0] = val;
+        }
+    }
+}
+
 #ifndef GENERATE_CUBIN
+uint32_t computeNbSubSeqPerSeqHopperF8MHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen)
+{
+    auto const env = std::getenv("XQA_NB_SUB_SEQ");
+    if (env != nullptr)
+    {
+        int32_t const val = std::stoi(env);
+        if (val > 0)
+        {
+            return val;
+        }
+    }
+    float const factor = 0.25f;
+    return mha::min<uint32_t>(
+        mha::max<uint32_t>(1U, (uint32_t) round(prop.multiProcessorCount * 3 / (batchSize * nbKHeads) * factor)),
+        divUp(maxSeqLen, gemm0CtaTileNbTokens));
+}
+
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -3233,7 +3547,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if USE_INPUT_KV
     InputHead const* qkv,
 #if ROPE_STYLE != 0
-    Vec<float, validElemsPerHead> const* ropeCosSin,
+    Vec<float, validRopeElemsPerHead> const* ropeCosSin,
 #endif
 #else
     InputHead const* q,
@@ -3260,6 +3574,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream)
 {
     if (beamWidth != 1)
@@ -3277,22 +3597,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     uint32_t const nbVHeads = nbKHeads;
     uint32_t const nbQHeads = nbKHeads * headGrpSize;
     uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
-    uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t
-    {
-        auto const env = std::getenv("XQA_NB_SUB_SEQ");
-        if (env != nullptr)
-        {
-            int32_t const val = std::stoi(env);
-            if (val > 0)
-            {
-                return val;
-            }
-        }
-        float const factor = 0.25f;
-        return mha::min<uint32_t>(
-            mha::max<uint32_t>(1U, (uint32_t) round(prop.multiProcessorCount * 3 / (batchSize * nbKHeads) * factor)),
-            divUp(maxSeqLen, gemm0CtaTileNbTokens));
-    }();
+    uint32_t const nbSubSeqPerSeq = computeNbSubSeqPerSeqHopperF8MHA(prop, batchSize, nbKHeads, maxSeqLen);
 #if SPEC_DEC
     uint32_t const qSeqLen = specDecParams.qSeqLen;
 #else
@@ -3362,6 +3667,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #endif
 #if SPEC_DEC
         specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+        skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        skippedBlockCount, totalBlockCount,
+#endif
 #endif
         semaphores, scratch);
 #else

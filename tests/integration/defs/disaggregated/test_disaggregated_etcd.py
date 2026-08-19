@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,14 +14,46 @@
 # limitations under the License.
 
 import os
+import platform
 import signal
 import subprocess
 import time
 
 import pytest
 import requests
+from defs.conftest import get_sm_version
 
 from tensorrt_llm.logger import logger
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
+    for UCX_TLS.
+    """
+    sm = get_sm_version()
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    if sm == 90:
+        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
+        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
+        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
+        return "^gdr_copy"
+    return "^ib,gdr_copy"
+
+
+# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 # Configuration file paths
 EXAMPLES_DIR = "examples/disaggregated"
@@ -61,7 +93,7 @@ def start_context_server(config,
     """Start a context server on specified GPU and port."""
     cmd = [
         "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--extra_llm_api_options", f"./{CONTEXT_CONFIG_FILE}",
+        str(port), "--config", f"./{CONTEXT_CONFIG_FILE}",
         "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
         "CONTEXT"
     ]
@@ -69,6 +101,7 @@ def start_context_server(config,
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
     process = subprocess.Popen(cmd,
@@ -87,7 +120,7 @@ def start_generation_server(config,
     """Start a generation server on specified GPU and port."""
     cmd = [
         "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--extra_llm_api_options", f"./{GENERATION_CONFIG_FILE}",
+        str(port), "--config", f"./{GENERATION_CONFIG_FILE}",
         "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
         "GENERATION"
     ]
@@ -95,6 +128,7 @@ def start_generation_server(config,
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")
     process = subprocess.Popen(cmd,

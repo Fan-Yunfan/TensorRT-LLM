@@ -21,7 +21,7 @@
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <memory>
 
@@ -84,6 +84,7 @@ void GptDecoder<T>::disableLookahead(
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
     penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
 
@@ -120,7 +121,7 @@ void GptDecoder<T>::disableLookahead(
 
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-    std::optional<DecodingOutput> const& output, std::optional<nvinfer1::DataType> explicitDraftTokensDType,
+    std::optional<DecodingOutput> const& output, std::optional<tensorrt_llm::DataType> explicitDraftTokensDType,
     std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt,
     std::optional<std::vector<tle::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs)
 {
@@ -136,6 +137,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
     penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
 

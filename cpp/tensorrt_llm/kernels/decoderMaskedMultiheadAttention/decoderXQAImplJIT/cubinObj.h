@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 #include <string>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunnerUtils.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -86,4 +87,5 @@ private:
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

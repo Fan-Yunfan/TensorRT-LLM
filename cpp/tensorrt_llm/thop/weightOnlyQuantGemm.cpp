@@ -15,12 +15,16 @@
  */
 #include "weightOnlyQuantGemm.h"
 #include "cutlass/numeric_types.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 
 #include <ATen/cuda/EmptyTensor.h>
 #include <optional>
 
 using namespace tensorrt_llm::kernels::cutlass_kernels;
 using namespace tensorrt_llm::kernels;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -91,7 +95,8 @@ WeightOnlyQuantGemmRunner::WeightOnlyQuantGemmRunner(at::ScalarType activation_d
 }
 
 at::Tensor WeightOnlyQuantGemmRunner::runGemm(at::Tensor const& mat_a, at::Tensor const& mat_b,
-    at::Tensor const& weight_scales, int64_t config_idx, bool to_userbuffers, std::optional<c10::ScalarType> out_dtype)
+    at::Tensor const& weight_scales, int64_t config_idx, int64_t output_buffer_kind,
+    std::optional<c10::ScalarType> out_dtype)
 {
     check_input_dtypes(mat_a, mat_b);
 
@@ -110,15 +115,10 @@ at::Tensor WeightOnlyQuantGemmRunner::runGemm(at::Tensor const& mat_a, at::Tenso
     }
 
     auto const dtype = out_dtype.value_or(mActivationDtype);
-    at::Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor({m, real_n}, dtype).first;
-    }
-    else
-    {
-        out = at::detail::empty_cuda({m, real_n}, dtype, mat_a.device(), std::nullopt);
-    }
+    // WeightOnlyQuantGemm does not support NcclWindow output; group is not needed here.
+    // If NcclWindow support is added in the future, a group must be passed explicitly.
+    auto [out, _] = torch_ext::allocate_output(
+        {m, real_n}, dtype, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), c10::nullopt);
 
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
 
@@ -156,10 +156,12 @@ int64_t WeightOnlyQuantGemmRunner::getNumConfigs() const
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::WeightOnlyQuantGemmRunner>("WeightOnlyQuantGemmRunner")
+    m.class_<tensorrt_llm::torch_ext::WeightOnlyQuantGemmRunner>("WeightOnlyQuantGemmRunner")
         .def(torch::init<at::ScalarType, at::ScalarType>())
-        .def("run_gemm", &torch_ext::WeightOnlyQuantGemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::WeightOnlyQuantGemmRunner::getNumConfigs);
+        .def("run_gemm", &tensorrt_llm::torch_ext::WeightOnlyQuantGemmRunner::runGemm)
+        .def("get_num_configs", &tensorrt_llm::torch_ext::WeightOnlyQuantGemmRunner::getNumConfigs);
 }

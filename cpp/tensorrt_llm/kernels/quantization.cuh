@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
@@ -24,8 +25,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -278,6 +279,34 @@ constexpr int CVT_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
+// Membermask for the __shfl_xor_sync butterfly among the NUM_THREADS_PER_SF
+// lanes that share one scale factor. The xor-1/xor-2 exchange never crosses
+// this aligned lane group, so only the group has to converge on the shuffle.
+//
+// Do not widen the mask to the full warp. A sync shuffle waits until every
+// lane named in the mask reaches the same call site, but here not every lane
+// of a warp gets there: in quantize_with_block_size, lanes that drew padding
+// columns (or ran out of columns) skip the cvt call and go wait at the CTA
+// barrier at the end of the kernel. If the data/padding boundary cuts through
+// a warp, a full-warp shuffle deadlocks against that barrier. A full mask can
+// also name lanes that were never launched, because blockDim is not always a
+// multiple of 32 (e.g. 200 threads leave the last warp with only 8 lanes);
+// that is undefined behavior.
+//
+// The group mask is always safe: blockDim and every column boundary (data,
+// padded, SF-padded) are multiples of the group size, so the lanes of one
+// group always reach the same set of shuffle calls together.
+template <int NUM_THREADS_PER_SF>
+inline __device__ uint32_t cvt_sf_group_shfl_mask()
+{
+    static_assert(NUM_THREADS_PER_SF == 2 || NUM_THREADS_PER_SF == 4, "Unsupported SF group size.");
+    constexpr uint32_t groupSize = static_cast<uint32_t>(NUM_THREADS_PER_SF);
+    constexpr uint32_t groupMask = (1U << groupSize) - 1U;
+    uint32_t laneId = 0;
+    asm("mov.u32 %0, %%laneid;" : "=r"(laneId));
+    return groupMask << (laneId & ~(groupSize - 1U));
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8])
 {
@@ -438,10 +467,11 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 
     constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
     // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
     if constexpr (CVT_NUM_THREADS_PER_SF == 4)
     {
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+        localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
     }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -539,7 +569,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     if constexpr (CVT_NUM_THREADS_PER_SF == 2)
     {
         // For block 32, we need to reduce the local max across two threads.
-        localMax = __hmax2(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+        localMax = __hmax2(__shfl_xor_sync(cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>(), localMax, 1), localMax);
     }
 
     // Get the final absolute maximum values.
@@ -615,10 +645,11 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
 
     constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
     // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
     if constexpr (CVT_NUM_THREADS_PER_SF == 4)
     {
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+        localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
     }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -777,6 +808,7 @@ quantize_with_block_size(
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    // This value is prepared by model, no need to be protected by ACKBULK
     float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
     // Is it swizzled layout?
@@ -792,79 +824,125 @@ quantize_with_block_size(
     int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
     int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
     // Input tensor batch/row/col loops.
+    // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
+    // This improves performance for small batch sizes with swizzled layout
     for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x)
     {
-        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        // Early exit for padding-only blocks: if this block only processes padding rows,
+        // we can skip the batch loop and just zero out the scale factors
+        bool isRowPadding = (rowIdx >= numRows);
+
+        if (isRowPadding)
         {
-            for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
+            // Fast path: This row is entirely padding, only zero out scale factors.
+            // Note: Padding rows do NOT exist in the output tensor (which is sized [numRows, K]),
+            // they only exist in the swizzled scale factor layout. Do NOT write to output buffer here.
+            for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
             {
-                std::optional<int> optionalBatchIdx = batchIdx;
-                std::optional<int> optionalNumRows = numRows;
-
-                // The SF output pointer.
-                auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
-
-                // The input tensor offset.
-                int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
-                int64_t outOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
-
-                // Set the values to 0 of those are padded columns.
-                if (rowIdx < numRows && colIdx >= numColThreads && colIdx < numPaddedColThreads)
+                for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
                 {
-                    // Dispatch the quantization kernel.
-                    if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
-                    {
-                        reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
-                    }
-                    else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
-                        || quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
-                    {
-                        reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
-                    }
-                }
+                    std::optional<int> optionalBatchIdx = batchIdx;
+                    std::optional<int> optionalNumRows = numRows;
 
-                // Set the SF padding to 0.
-                if (rowIdx >= numRows || colIdx >= numColThreads)
-                {
+                    // The SF output pointer.
+                    auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
                     // Set the SF padding to 0.
                     if (sf_out != nullptr)
                     {
                         sf_out[0] = 0x00;
                     }
                 }
-                else
+            }
+        }
+        else
+        {
+            // Normal path: This row contains actual data
+            for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+            {
+                for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
                 {
-                    // Load the input vector.
-                    PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+                    std::optional<int> optionalBatchIdx = batchIdx;
+                    std::optional<int> optionalNumRows = numRows;
 
-                    // Dispatch the quantization kernel.
-                    if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
+                    // The SF output pointer.
+                    auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                        optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
+                    // The input tensor offset.
+                    int64_t inOffset = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+                    int64_t outOffset
+                        = static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+                    // Set the values to 0 of those are padded columns.
+                    if (colIdx >= numColThreads && colIdx < numPaddedColThreads)
                     {
-                        reinterpret_cast<uint32_t*>(out)[outOffset]
-                            = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                        // Dispatch the quantization kernel.
+                        if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
+                        {
+                            reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
+                        }
+                        else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
+                            || quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
+                        {
+                            reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+                        }
                     }
-                    else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4)
+
+                    // Set the SF padding to 0.
+                    if (colIdx >= numColThreads)
                     {
-                        reinterpret_cast<uint64_t*>(out)[outOffset]
-                            = cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                        // Set the SF padding to 0.
+                        if (sf_out != nullptr)
+                        {
+                            sf_out[0] = 0x00;
+                        }
                     }
-                    else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
+                    else
                     {
-                        reinterpret_cast<uint64_t*>(out)[outOffset]
-                            = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+                        // Load the input vector.
+                        PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+
+                        // Dispatch the quantization kernel.
+                        if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
+                        {
+                            reinterpret_cast<uint32_t*>(out)[outOffset]
+                                = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                        }
+                        else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4)
+                        {
+                            reinterpret_cast<uint64_t*>(out)[outOffset]
+                                = cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                        }
+                        else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
+                        {
+                            reinterpret_cast<uint64_t*>(out)[outOffset]
+                                = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+                        }
                     }
                 }
             }
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;");
+    // PDL completion is reported when every CTA has either exited or called
+    // this function at least once (per CUDA Programming Guide). Without a
+    // CTA-wide barrier, an early-finishing warp can trigger completion while
+    // other warps in the same CTA are still writing sf_out / out, allowing the
+    // downstream NVF4 GEMM consumer to read partial data once
+    // wait_on_dependent_grids returns. Each thread first makes its own stores
+    // device-visible; the barrier then guarantees every thread has done so
+    // before any thread can reach the trigger.
+    __threadfence();
+    __syncthreads();
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
 __global__ void block_scale_interleave_kernel(
     int numbatches, int numRows, int numCols, uint8_t const* SFIn, uint8_t* SFOutput);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

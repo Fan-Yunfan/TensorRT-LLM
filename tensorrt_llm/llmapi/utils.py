@@ -1,7 +1,11 @@
 import asyncio
 import collections
+import ctypes
+import datetime
 import hashlib
+import inspect
 import io
+import math
 import os
 import re
 import sys
@@ -11,11 +15,12 @@ import time
 import traceback
 import warnings
 import weakref
-from functools import cache, wraps
+from contextlib import nullcontext
+from functools import wraps
 from pathlib import Path
-from queue import Queue
-from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
-                    get_type_hints)
+from queue import Empty, Queue
+from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
+                    Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -28,6 +33,18 @@ from tqdm.auto import tqdm
 from tensorrt_llm.logger import Singleton, logger
 
 
+class StrictBaseModel(BaseModel):
+    """
+    A base model that forbids arbitrary fields.
+
+    All user-facing configuration classes should inherit from this to ensure
+    typos and invalid fields are caught at validation time.
+    """
+
+    class Config:
+        extra = "forbid"
+
+
 def print_traceback_on_error(func):
 
     @wraps(func)
@@ -35,7 +52,7 @@ def print_traceback_on_error(func):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            print_colored_debug(f"Exception in {func.__name__}: {e}\n", "red")
+            logger_debug(f"Exception in {func.__name__}: {e}\n", "red")
             traceback.print_exc()
             raise e
 
@@ -52,6 +69,7 @@ def print_colored(message,
         bold_red="\x1b[31;1m",
         bold_green="\033[1;32m",
         green="\033[0;32m",
+        cyan="\033[0;36m",
     )
     reset = "\x1b[0m"
 
@@ -61,11 +79,58 @@ def print_colored(message,
         writer.write(message)
 
 
-def print_colored_debug(message,
-                        color: Optional[str] = None,
-                        writer: io.TextIOWrapper = sys.stderr):
-    if enable_llm_debug():
-        print_colored(message, color, writer)
+def get_current_location(skip_frames: int = 2) -> str:
+    """
+    Get the current execution location in format 'module.class.function'.
+
+    Args:
+        skip_frames: Number of stack frames to skip (default 2 to skip this function and its caller)
+
+    Returns:
+        String in format 'module.class.function' or 'module.function' if not in a class
+    """
+    stack = inspect.stack()
+    if len(stack) <= skip_frames:
+        return "unknown"
+
+    frame = stack[skip_frames]
+    module_name = frame.frame.f_globals.get('__name__', 'unknown')
+    function_name = frame.function
+
+    # Try to determine if we're in a class method
+    class_name = None
+    if 'self' in frame.frame.f_locals:
+        # This is likely an instance method
+        obj = frame.frame.f_locals['self']
+        class_name = obj.__class__.__name__
+    elif 'cls' in frame.frame.f_locals:
+        # This might be a class method
+        cls = frame.frame.f_locals['cls']
+        if inspect.isclass(cls):
+            class_name = cls.__name__
+
+    # Build the location string
+    if class_name:
+        return f"{module_name}.{class_name}.{function_name}"
+    else:
+        return f"{module_name}.{function_name}"
+
+
+def logger_debug(message,
+                 color: Optional[str] = None,
+                 writer: io.TextIOWrapper = sys.stderr):
+    """ Print the message if the llmapi debug mode is enabled. Fallback to logger.debug if not. """
+    if enable_llmapi_debug():
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        location = get_current_location()
+        cur_dualname = "..." + location[-47:] if len(
+            location) > 50 else location
+        print_colored(f"{timestamp} [{cur_dualname}]", "bold_green", writer)
+        print_colored(f" {message}\n", color, writer)
+        writer.flush()
+    else:
+        # Fallback to logger.debug
+        logger.debug(message)
 
 
 def file_with_glob_exists(directory, glob) -> bool:
@@ -84,7 +149,12 @@ def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
-def get_total_gpu_memory(device: int) -> float:
+def get_total_gpu_memory(device: int) -> int:
+    # Compat for no GPU environment, only for device=0.
+    # Otherwise, the caller should ensure there are that many GPUs.
+    if device == 0 and get_device_count() == 0:
+        return 0
+
     return torch.cuda.get_device_properties(device).total_memory
 
 
@@ -105,19 +175,6 @@ class GpuArch:
 
 def get_gpu_arch(device: int = 0) -> int:
     return torch.cuda.get_device_properties(device).major
-
-
-class ContextManager:
-    ''' A helper to create a context manager for a resource. '''
-
-    def __init__(self, resource):
-        self.resource = resource
-
-    def __enter__(self):
-        return self.resource.__enter__()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return self.resource.__exit__(exc_type, exc_value, traceback)
 
 
 def is_directory_empty(directory: Path) -> bool:
@@ -167,11 +224,13 @@ def get_file_lock(model_name: str,
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     ignore_patterns = ["original/**/*"]
+    logger.info(f"Downloading model {model} from HuggingFace")
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
@@ -179,19 +238,36 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
             ignore_patterns=ignore_patterns,
             revision=revision,
             tqdm_class=DisabledTqdm)
+    logger.info(f"Finished downloading model {model} from HuggingFace")
     return Path(hf_folder)
 
 
-def download_hf_pretrained_config(model: str,
-                                  revision: Optional[str] = None) -> Path:
+def download_hf_partial(model: str,
+                        allow_patterns: List[str],
+                        revision: Optional[str] = None) -> Path:
+    """Download a partial model from HuggingFace.
+
+    Args:
+        model: The model name or path.
+        revision: The revision to use for the model.
+        allow_patterns: The patterns to allow for the model.
+
+    Returns:
+        The path to the downloaded model.
+    """
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             revision=revision,
-            allow_patterns=["config.json"],
+            allow_patterns=allow_patterns,
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
+
+
+def download_hf_pretrained_config(model: str,
+                                  revision: Optional[str] = None) -> Path:
+    return download_hf_partial(model, ["config.json"], revision)
 
 
 def append_docstring(docstring: str):
@@ -244,34 +320,36 @@ class ManagedThread(threading.Thread):
                  task: Callable[..., bool],
                  error_queue: Queue,
                  name: Optional[str] = None,
+                 stop_event: Optional[threading.Event] = None,
+                 context: Optional[ContextManager[Any]] = None,
                  **kwargs):
         super().__init__(name=name)
         self.task = task
         self.error_queue = error_queue
         self.kwargs = kwargs
         self.daemon = True
-
-        self.stop_event = threading.Event()
+        self.stop_event = stop_event or threading.Event()
+        self.context = context or nullcontext()
 
     def run(self):
+        with self.context:
+            while not self.stop_event.is_set():
+                task = self.task
+                if isinstance(task, weakref.WeakMethod):
+                    task = task()
+                    if task is None:
+                        # Normally, this should not happen.
+                        logger.warning("WeakMethod is expired.")
+                        break
 
-        while not self.stop_event.is_set():
-            task = self.task
-            if isinstance(task, weakref.WeakMethod):
-                task = task()
-                if task is None:
-                    # Normally, this should not happen.
-                    logger.warning("WeakMethod is expired.")
-                    break
-
-            try:
-                if not task(**self.kwargs):
-                    break
-            except Exception as e:
-                logger.error(
-                    f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
-                )
-                self.error_queue.put(e)
+                try:
+                    if not task(**self.kwargs):
+                        break
+                except Exception as e:
+                    logger.error(
+                        f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
+                    )
+                    self.error_queue.put(e)
 
         logger.info(f"Thread {self.name} stopped.")
 
@@ -290,7 +368,17 @@ def enable_llm_debug() -> bool:
     return _enable_llm_debug_
 
 
-@cache
+_enable_llmapi_debug_ = None
+
+
+def enable_llmapi_debug() -> bool:
+    global _enable_llmapi_debug_
+    if _enable_llmapi_debug_ is None:
+        _enable_llmapi_debug_ = os.environ.get("TLLM_LLMAPI_ENABLE_DEBUG",
+                                               "0") == "1"
+    return _enable_llmapi_debug_
+
+
 def enable_worker_single_process_for_tp1() -> bool:
     ''' Tell whether to make worker use single process for TP1.
     This is helpful for return-logits performance and debugging. '''
@@ -446,32 +534,155 @@ class _SyncQueue:
 
         # We can't call asyncio.run_coroutine_threadsafe(self._aq.get(), self.loop) and wait the returned Future,
         # since we are in the same event loop, and we can't yield the thread while waiting result.
-        deadline = None if timeout is None else time.time() + timeout
-        while deadline is None or time.time() < deadline:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
             try:
                 return self._aq.unsafe_get()
             except asyncio.QueueEmpty:
-                time.sleep(0.01)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Match `queue.Queue.get()` semantics; a silent `None` return would be
+                        # mis-handled downstream as an unknown response type.
+                        raise Empty() from None
+                    time.sleep(min(0.01, remaining))
+                else:
+                    time.sleep(0.01)
 
 
-def set_sched_setaffinity(required_cores: int):
-    ''' Set the CPU affinity of the current process to the required number of
-    cores.
+def get_numa_aware_cpu_affinity(device_id):
+    '''Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
 
-    Known issue: This may race with other processes that also set the affinity.
+    Args:
+        device_id: The CUDA device ID to query for optimal CPU affinity.
+                   This is the logical CUDA device index (after
+                   CUDA_VISIBLE_DEVICES remapping). The function will
+                   resolve it to the physical NVML device index.
+
+    Returns:
+        List of CPU IDs representing the optimal CPU affinity mask for the device.
+
+    Raises:
+        pynvml.NVMLError: If NVML operations fail or device_id is invalid.
     '''
-    cpu_percentages = psutil.cpu_percent(percpu=True)
-    # sort the cores by usage
-    free_cores = sorted(range(len(cpu_percentages)),
-                        key=lambda i: cpu_percentages[i])
+    cpu_count = psutil.cpu_count()
 
+    # If this is not a NUMA system, or we hit an exception, default to
+    # unconstrained CPU affinity
+    cpu_affinity = list(range(cpu_count))
+
+    if not os.path.isdir("/sys/devices/system/node/node1"):
+        return cpu_affinity
+
+    try:
+        # initialize NVML
+        import pynvml
+        pynvml.nvmlInit()
+
+        # Resolve the physical NVML device index from the logical CUDA
+        # device_id.  NVML always enumerates *all* GPUs on the system
+        # regardless of CUDA_VISIBLE_DEVICES, so when the user restricts
+        # visibility (e.g. CUDA_VISIBLE_DEVICES=3,4), logical device 0
+        # actually corresponds to physical GPU 3.
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible is not None and cuda_visible.strip():
+            visible_tokens = [
+                x.strip() for x in cuda_visible.split(",") if x.strip()
+            ]
+            if 0 <= device_id < len(visible_tokens):
+                token = visible_tokens[device_id]
+                if token.isdigit():
+                    nvml_device_id = int(token)
+                else:
+                    logger.warning(
+                        f"CUDA_VISIBLE_DEVICES token '{token}' is non-numeric; "
+                        f"falling back to device_id ({device_id}) as NVML index."
+                    )
+                    nvml_device_id = device_id
+            else:
+                logger.warning(
+                    f"device_id {device_id} exceeds CUDA_VISIBLE_DEVICES "
+                    f"list length ({len(visible_tokens)}), falling back to "
+                    f"device_id as NVML index.")
+                nvml_device_id = device_id
+        else:
+            nvml_device_id = device_id
+
+        # Get the number of bits per ulong
+        c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+
+        # Determine how large our cpu set array from NVML needs to be
+        cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
+
+        # Get the optimal CPU affinity for this device according to the NUMA
+        # topology
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
+        affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+
+        # Convert CPU masks to python list
+        cpu_affinity = []
+        for cpu_id in range(cpu_count):
+            mask_array_index = cpu_id // c_ulong_bits
+            mask_bit_index = cpu_id % c_ulong_bits
+            if affinity_masks[mask_array_index] & (1 << mask_bit_index):
+                cpu_affinity.append(cpu_id)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            pass  # Ignore shutdown errors
+
+    return cpu_affinity
+
+
+def configure_cpu_affinity(device_id: int) -> None:
+    """Probe and configure the CPU affinity of the calling process based on NUMA topology.
+
+    Args:
+        device_id: The CUDA device ID to determine optimal CPU affinity.
+
+    Note:
+        If the process already has constrained affinity, a warning is logged.
+        Configuration is handled as follows:
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
+                -> Affinity is automatically configured if it is unconstrained,
+                   and deleted if it is constrained externally by the user.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
+                -> Affinity is unconditionally auto-configured.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
+                -> Affinity is unconditionally _not_ auto-configured.
+    """
     pid = os.getpid()
-    os.sched_setaffinity(pid, set(free_cores[:required_cores]))
+    process = psutil.Process(pid)
+    cpu_affinity = process.cpu_affinity()
 
+    all_cpus = list(range(psutil.cpu_count()))
 
-def clear_sched_affinity(pid: int):
-    ''' Clear the CPU affinity of the current process. '''
-    os.sched_setaffinity(pid, set(range(psutil.cpu_count())))
+    constrained_affinity = (cpu_affinity != all_cpus)
+    numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+
+    # If affinity is constrained but the user hasn't explicitly
+    # requested NUMA-aware affinity, remove the constraints.
+    if constrained_affinity:
+        logger.warning(
+            f"Worker process {pid} is affined to run on the following CPUs: "
+            f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+            f"performance if set incorrectly.")
+        if numa_aware_affinity is None:
+            logger.warning(f"Worker process {pid} has constrained CPU affinity "
+                           f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
+                           f"Removing CPU affinity constraints.")
+            process.cpu_affinity(all_cpus)
+
+    # If affinity is unconstrained and the user hasn't explicitly
+    # prohibited it or the user has explicitly requested it, choose the
+    # optimal affinity based upon the NUMA topology
+    if ((numa_aware_affinity is None and not constrained_affinity)
+            or (numa_aware_affinity == "1")):
+        process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+        logger.info(
+            f"Worker process {pid} CPU affinity set to "
+            f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],

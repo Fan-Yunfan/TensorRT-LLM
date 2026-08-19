@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/virtualMemory.h"
 #include "bufferManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <forward_list>
 #include <shared_mutex>
@@ -141,8 +142,8 @@ void OffloadConfigurator::teardown(CUmemGenericAllocationHandle, bool destructin
     {
         switch (mBackType)
         {
-        case MemoryType::kCPU: mBackedStorage = BufferManager::cpu(mSize, nvinfer1::DataType::kINT8); break;
-        case MemoryType::kPINNED: mBackedStorage = BufferManager::pinned(mSize, nvinfer1::DataType::kINT8); break;
+        case MemoryType::kCPU: mBackedStorage = BufferManager::cpu(mSize, tensorrt_llm::DataType::kINT8); break;
+        case MemoryType::kPINNED: mBackedStorage = BufferManager::pinned(mSize, tensorrt_llm::DataType::kINT8); break;
         default: TLLM_THROW("Unknown memory type: %d", static_cast<int32_t>(mBackType));
         }
     }
@@ -339,16 +340,12 @@ static void* deviceptr_cast(CUdeviceptr ptr)
 void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int device) const
 {
     CUdeviceptr address{};
-    std::size_t const pageAlignedSize = mConfig->pageAligned(n);
-    TLLM_CU_CHECK(cuMemAddressReserve(&address, pageAlignedSize, 0, {}, 0));
+    std::size_t const alignedSize = mConfig->aligned(n, device);
+    TLLM_CU_CHECK(cuMemAddressReserve(&address, alignedSize, 0, {}, 0));
 
     CUDAVirtualMemoryChunk::Configurators configurators;
-    configurators.push_back(std::make_unique<UnicastConfigurator>(address, n,
-        CUmemAccessDesc{{
-                            CU_MEM_LOCATION_TYPE_DEVICE,
-                            device,
-                        },
-            CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+    configurators.push_back(std::make_unique<UnicastConfigurator>(address, alignedSize,
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
     switch (mConfig->mMode)
     {
@@ -368,11 +365,8 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
 
     mConfig->mManager.add(address, mConfig->mTag,
         std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                             {
-                                                 CU_MEM_LOCATION_TYPE_DEVICE,
-                                                 device,
-                                             }},
-            n),
+                                             CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
+            alignedSize),
         std::move(configurators));
 
     *ptr = deviceptr_cast(address);
@@ -383,8 +377,8 @@ void CudaVirtualMemoryAllocator::deallocate(Pointer ptr, std::size_t n) const
     auto const address = deviceptr_cast(ptr);
     mConfig->mManager.remove(address);
 
-    std::size_t const pageAlignedSize = mConfig->pageAligned(n);
-    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
+    std::size_t const alignedSize = mConfig->aligned(n);
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, alignedSize));
 }
 
 } // namespace tensorrt_llm::runtime
@@ -402,32 +396,30 @@ using AllocConf = CudaVirtualMemoryAllocator::Configuration;
 
 AllocConf AllocConf::backgroundConfiguration{getVirtualMemoryManager(), "", NONE, nullptr, true};
 
-static const std::shared_ptr<AllocConf> bgConf{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration};
-
-static std::shared_mutex currentConfMutex;
-static std::shared_ptr<AllocConf> currentConf = bgConf;
+static std::shared_mutex sConfMutex;
+static std::shared_ptr<AllocConf> sCurrentConf{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration};
+static std::vector<std::shared_ptr<AllocConf>> sConfStack;
 
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
 {
-    std::shared_lock lock(currentConfMutex);
-    return CudaVirtualMemoryAllocator{currentConf};
+    std::shared_lock lock(sConfMutex);
+    return CudaVirtualMemoryAllocator{sCurrentConf};
 }
 
-void setVirtualMemoryAllocator(
+void pushVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
-    std::unique_lock lock(currentConfMutex);
-
-    TLLM_CHECK_WITH_INFO(currentConf == bgConf,
-        "An active virtual memory allocator (tag: %s, mode: %d, stream: %p) is already present",
-        currentConf->mTag.c_str(), currentConf->mMode, currentConf->mBackStream.get());
-    currentConf = std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream);
+    std::unique_lock lock(sConfMutex);
+    sCurrentConf.swap(
+        sConfStack.emplace_back(std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream)));
 }
 
-void clearVirtualMemoryAllocator()
+void popVirtualMemoryAllocator()
 {
-    std::unique_lock lock(currentConfMutex);
-    currentConf = bgConf;
+    std::unique_lock lock(sConfMutex);
+    TLLM_CHECK_WITH_INFO(!sConfStack.empty(), "popVirtualMemoryAllocator called with empty stack");
+    sCurrentConf.swap(sConfStack.back());
+    sConfStack.pop_back();
 }
 
 } // namespace tensorrt_llm::runtime

@@ -3,7 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from parameterized import parameterized
 from transformers import MixtralConfig
 from transformers import MixtralForCausalLM as HFMixtralForCausalLM
@@ -15,8 +15,8 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.mixtral_weight_mapper import \
     MixtralHfWeightMapper
-from tensorrt_llm._torch.models.modeling_mixtral import MixtralForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+from tensorrt_llm._torch.models.modeling_mixtral import (MixtralAttention,
+                                                         MixtralForCausalLM)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -310,10 +310,8 @@ class TestMixtral(unittest.TestCase):
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-        graph_runner = None
-        if scenario.use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(
+            1) if scenario.use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
@@ -358,3 +356,33 @@ class TestMixtral(unittest.TestCase):
         if graph_runner is not None:
             graph_runner.clear()
         kv_cache_manager.shutdown()
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_mixtral.Attention.forward")
+    def test_mixtral_attention_swa_wiring(self, mocked_forward):
+        """Verify MixtralAttention.forward passes sliding_window to Attention.forward."""
+        config_dict = deepcopy(MIXTRAL_8X7B_CONFIG)
+        config_dict["sliding_window"] = 4096
+        config = MixtralConfig.from_dict(config_dict)
+        mc = ModelConfig(pretrained_config=config,
+                         mapping=Mapping(world_size=1, tp_size=1, rank=0))
+        attn = MixtralAttention(mc, layer_idx=0)
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+        mocked_forward.assert_called_once()
+        _, call_kwargs = mocked_forward.call_args
+        self.assertEqual(call_kwargs["attention_window_size"], 4096)
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_mixtral.Attention.forward")
+    def test_mixtral_attention_swa_none_when_unset(self, mocked_forward):
+        """Verify MixtralAttention.forward passes None when sliding_window is unset."""
+        config_dict = deepcopy(MIXTRAL_8X7B_CONFIG)
+        config_dict["sliding_window"] = None
+        config = MixtralConfig.from_dict(config_dict)
+        mc = ModelConfig(pretrained_config=config,
+                         mapping=Mapping(world_size=1, tp_size=1, rank=0))
+        attn = MixtralAttention(mc, layer_idx=0)
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+        mocked_forward.assert_called_once()
+        _, call_kwargs = mocked_forward.call_args
+        self.assertIsNone(call_kwargs["attention_window_size"])

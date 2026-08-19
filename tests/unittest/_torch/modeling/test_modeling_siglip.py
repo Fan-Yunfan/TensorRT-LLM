@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -42,6 +45,11 @@ ACCURACY_CONFIG = {
     'default': (2e-2, 5e-2),
     'gemma3': (5e-1, 5e-1),
 }
+
+# Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder
+# ``AttentionMetadata`` is sized once at load to this maximum; each forward
+# re-preps it with the real per-image sequence lengths.
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
 @dataclass(repr=False)
@@ -106,7 +114,11 @@ class TestSiglipVisionModel(unittest.TestCase):
             attn_backend=backend,
         )
 
-        tllm_model = SiglipVisionModel(model_config).to(dtype).to(device)
+        tllm_model = SiglipVisionModel(
+            model_config, use_post_layernorm=True).to(dtype).to(device)
+        # Engine normally calls this after model load; standalone tests must do it themselves.
+        tllm_model.setup_attn_metadata(
+            max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
         tllm_model.load_weights(hf_model.state_dict())
 
         # Prepare inputs - create random pixel values for images
@@ -134,10 +146,19 @@ class TestSiglipVisionModel(unittest.TestCase):
             attn_metadata=attn_metadata,
         )
 
-        # Compare all hidden states
+        # Compare all hidden states.
+        # TRT-LLM applies post_layernorm to the last encoder hidden state
+        # (matching production usage), so the last element must be compared
+        # against HF's post_layernormed last_hidden_state rather than the
+        # raw hidden_states[-1].
+        num_states = len(tllm_outputs)
+        for i in range(num_states):
+            tllm_hs = tllm_outputs[i]
+            if i < num_states - 1:
+                hf_hs = hf_outputs.hidden_states[i]
+            else:
+                hf_hs = hf_outputs.last_hidden_state
 
-        for i, (hf_hs, tllm_hs) in enumerate(
-                zip(hf_outputs.hidden_states, tllm_outputs)):
             self.assertEqual(hf_hs.shape, tllm_hs.shape,
                              f"Shape mismatch for hidden state {i}")
 

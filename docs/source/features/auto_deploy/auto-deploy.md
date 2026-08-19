@@ -1,12 +1,13 @@
-# AutoDeploy (Prototype)
+# AutoDeploy (Beta)
 
 ```{note}
-This project is under active development and is currently in a prototype stage. The code is a prototype, subject to change, and may include backward-incompatible updates. While we strive for correctness, there are no guarantees regarding functionality, stability, or reliability.
+This project is under active development and is currently released as beta feature. The code is
+subject to change, and may include backward-incompatible updates.
 ```
 
 ## Seamless Model Deployment from PyTorch to TensorRT LLM
 
-AutoDeploy is a prototype designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models such as those from the Hugging Face Transformers library, to TensorRT LLM.
+AutoDeploy is designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models such as those from the Hugging Face Transformers library, to TensorRT LLM.
 
 ![AutoDeploy overview](../../media/ad_overview.png)
 <sub><em>AutoDeploy overview and relation with TensorRT LLM's LLM API</em></sub>
@@ -31,13 +32,13 @@ AutoDeploy is included with the TRT-LLM installation.
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
-You can refer to [TRT-LLM installation guide](../../installation/linux.md) for more information.
+You can refer to the [TRT-LLM installation guide](../../installation/installation-guide.md) for more information.
 
 2. **Run Llama Example:**
 
-You are now ready to run an in-framework LLama Demo.
+You are now ready to run an in-framework Llama Demo.
 
-The general entry point for running the AutoDeploy demo is the `build_and_run_ad.py` script, Checkpoints are loaded directly from Huggingface (HF) or a local HF-like directory:
+The general entry point for running the AutoDeploy demo is the `build_and_run_ad.py` script. Checkpoints are loaded directly from Huggingface (HF) or a local HF-like directory:
 
 ```bash
 cd examples/auto_deploy
@@ -52,6 +53,10 @@ The exported graph then undergoes a series of automated transformations, includi
 
 - [Support Matrix](support_matrix.md)
 
+## API Reference
+
+- [AutoDeploy Transforms](transforms.rst)
+
 ## Advanced Usage
 
 - [Example Run Script](./advanced/example_run.md)
@@ -59,6 +64,8 @@ The exported graph then undergoes a series of automated transformations, includi
 - [Incorporating AutoDeploy into Your Own Workflow](./advanced/workflow.md)
 - [Expert Configurations](./advanced/expert_configurations.md)
 - [Performance Benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
+- [KV Cache Architecture](./advanced/kv_cache_architecture.md)
+- [Testing Strategy](./advanced/testing_strategy.md)
 
 ## Roadmap
 

@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #ifndef ENABLE_NVRTC
@@ -37,6 +42,10 @@
 #define USE_SMALL_IO 0
 #else
 #define USE_SMALL_IO 1
+#endif
+
+#ifndef XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES
+#define XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES 1
 #endif
 
 void warmup(cudaDeviceProp const& prop, float ms, cudaStream_t stream = nullptr);
@@ -79,7 +88,22 @@ public:
     {
         if (!isTracing)
         {
+#if CUDA_VERSION >= 13000
+            cudaMemLocation location;
+            if (dstDevice == cudaCpuDeviceId)
+            {
+                location.type = cudaMemLocationTypeHost;
+                location.id = 0;
+            }
+            else
+            {
+                location.type = cudaMemLocationTypeDevice;
+                location.id = dstDevice;
+            }
+            checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), location, 0, stream));
+#else
             checkCuda(cudaMemPrefetchAsync(get(), sizeof(T) * size(), dstDevice, stream));
+#endif
         }
     }
 
@@ -130,7 +154,8 @@ template <uint32_t nbKHeads>
 #endif
 #endif
 void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, bool verbose = false,
-    bool saveData = false, bool hasAttentionSinks = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = 1U << 30)
+    bool saveData = false, bool hasAttentionSinks = false, uint32_t ctxLen = ~0U, uint32_t slidingWinSize = 1U << 30,
+    float skipSoftmaxThresholdScaleFactor = 0.0f)
 {
 #if IS_MLA
     if (nbKHeads != 1)
@@ -204,6 +229,12 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         seqLen = (16U << 20) / gmemCacheHeadBytes; // 32MB per K+V head.
     }
     ctxLen = std::min(ctxLen, seqLen);
+    uint32_t skippedBlockCount = 0;
+    uint32_t totalBlockCount = 0;
+    if (skipSoftmaxThresholdScaleFactor > 0)
+    {
+        assert(useQGMMA);
+    }
     float const kScale = cacheElemSize == 2 ? 1.f : 1 / 4.f;
     float const vScale = kScale;
     float const qScale = 1.f;
@@ -276,17 +307,35 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     std::unique_ptr<CUevent_st, cudaError (*)(cudaEvent_t)> const ticEv{tic, &cudaEventDestroy};
     std::unique_ptr<CUevent_st, cudaError (*)(cudaEvent_t)> const tocEv{toc, &cudaEventDestroy};
 
-    auto const ropeCosSin = ManagedMemBuf<Vec<float, validElemsPerKHead>>(seqLen);
+    // The cos/sin cache only covers the rope region (validRopeElemsPerHead elements per position);
+    // for full rotary this equals the head size, for partial rotary it is smaller.
+    auto const ropeCosSin = ManagedMemBuf<Vec<float, validRopeElemsPerHead>>(seqLen);
+#if USE_INPUT_KV && ROPE_STYLE != 0
+    auto const fullHeadRopeCosSin = ManagedMemBuf<Vec<float, validElemsPerHead>>(seqLen);
+#endif
 #if USE_INPUT_KV && defined(ROPE_STYLE) && ROPE_STYLE
     for (uint32_t m = 0; m < seqLen; m++)
     {
         auto& pairs = ropeCosSin[m];
-        constexpr uint32_t nbPairs = exactDiv(validElemsPerKHead, 2);
+#if USE_INPUT_KV && ROPE_STYLE != 0
+        auto& fullHeadPairs = fullHeadRopeCosSin[m];
+        constexpr uint32_t nbFullHeadPairs = exactDiv(validElemsPerHead, 2);
+        for (uint32_t i = 0; i < nbFullHeadPairs; i++)
+        {
+            fullHeadPairs[i * 2] = 1.F;
+            fullHeadPairs[i * 2 + 1] = 0.F;
+        }
+#endif
+        constexpr uint32_t nbPairs = exactDiv(validRopeElemsPerHead, 2);
         for (uint32_t i = 0; i < nbPairs; i++)
         {
             float const theta = m * std::pow(1E4F, (-1.F / nbPairs) * i);
             pairs[i * 2] = std::cos(theta);
             pairs[i * 2 + 1] = std::sin(theta);
+#if USE_INPUT_KV && ROPE_STYLE != 0
+            fullHeadPairs[i * 2] = pairs[i * 2];
+            fullHeadPairs[i * 2 + 1] = pairs[i * 2 + 1];
+#endif
         }
     }
 #endif
@@ -309,6 +358,17 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     auto const rcpOutScale = ManagedMemBuf<float>(1);
     auto const seqLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
     auto const ctxLenList = ManagedMemBuf<uint32_t[beamWidth]>(batchSize);
+#if SKIP_SOFTMAX_ATTN
+#ifdef SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    auto const kernelSkippedBlockCount = ManagedMemBuf<uint32_t>(1);
+    auto const kernelTotalBlockCount = ManagedMemBuf<uint32_t>(1);
+    kernelSkippedBlockCount[0] = 0;
+    kernelTotalBlockCount[0] = 0;
+#endif
+#else
+    EXPECT_EQ(skipSoftmaxThresholdScaleFactor, 0.0f)
+        << "Got non-zero skipSoftmaxThresholdScaleFactor while SKIP_SOFTMAX_ATTN is not enabled.";
+#endif
 #if USE_PAGED_KV_CACHE
     auto const pageListBuf = ManagedMemBuf<std::byte>(pageListBytes);
 #if PAGED_KV_CACHE_LAYOUT == 1
@@ -507,6 +567,9 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
 #if IS_MLA
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+        // VLLM format: K and V share the same pageList, no copy needed
+#else
         for (uint32_t idxReq = 0; idxReq < batchSize; idxReq++)
         {
             for (uint32_t idxBeam = 0; idxBeam < beamWidth; idxBeam++)
@@ -517,6 +580,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
                 }
             }
         }
+#endif
 #else
         static_assert(false, "not implemented");
 #endif
@@ -613,6 +677,36 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
         }
     }
 
+#if USE_PAGED_KV_CACHE && SLIDING_WINDOW && XQA_TEST_POISON_SLIDING_WINDOW_PREFIX_PAGES
+    {
+        constexpr KVCachePageIndex kPoisonPageIdx = static_cast<KVCachePageIndex>(1U << 20);
+#if SPEC_DEC
+        uint32_t const firstQSeqLen = seqLen - qSeqLen + 1;
+        uint32_t const seqBeg = firstQSeqLen < slidingWinSize ? 0 : firstQSeqLen - slidingWinSize;
+#else
+        uint32_t const seqBeg = seqLen < slidingWinSize ? 0 : seqLen - slidingWinSize;
+#endif
+        uint32_t const nbPoisonPages = std::min<uint32_t>(seqBeg / tokensPerPage, nbPagesPerSeq);
+#if PAGED_KV_CACHE_LAYOUT == 1
+        for (uint32_t batch = 0; batch < batchSize; batch++)
+        {
+            std::fill_n(pageList[batch], nbPoisonPages, kPoisonPageIdx);
+        }
+#else
+        for (uint32_t batch = 0; batch < batchSize; batch++)
+        {
+            for (uint32_t beam = 0; beam < beamWidth; beam++)
+            {
+                for (uint32_t kv = 0; kv < 2; kv++)
+                {
+                    std::fill_n(pageList[batch][beam][kv], nbPoisonPages, kPoisonPageIdx);
+                }
+            }
+        }
+#endif
+    }
+#endif
+
     // Allocate the attention sinks (per head)
     auto attentionSinks = ManagedMemBuf<float>(nbQHeads);
     // The attention sinks ptr.
@@ -691,48 +785,6 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #else
             &output[0][0][0], &qHeads[0][0][0],
 #endif
-            cacheHeads.get(),
-#if USE_PAGED_KV_CACHE
-            pageListArg,
-#endif
-            maxSeqLen, &seqLenList[0][0], batchSize, kvCacheScale.get(), semaphores.get(), scratch, stream);
-    };
-#else
-    auto runKernel = [&]()
-    {
-        auto const launchFunc = useQGMMA ? &launchHopperF8MHA : &launchMHA;
-
-#if SPEC_DEC
-        SpecDecParams const specDecParams{.qSeqLen = qSeqLen,
-            .qCuSeqLens = reinterpret_cast<uint32_t const*>(deviceCuQSeqLen),
-            .mask = reinterpret_cast<MaskType const*>(devicePackedMask)};
-#endif
-        launchFunc(prop, nbKHeads,
-#if SLIDING_WINDOW
-            slidingWinSize,
-#endif
-            qScale,
-#if SPEC_DEC
-            &output[0][0][0][0],
-#else
-            &output[0][0][0],
-#endif
-#if LOW_PREC_OUTPUT
-            rcpOutScale.get(),
-#endif
-#if USE_INPUT_KV
-            &qkvHeads[0][0][0],
-#if ROPE_STYLE != 0
-            ropeCosSin.get(),
-#endif
-#else
-#if SPEC_DEC
-            &qHeads[0][0][0][0],
-#else
-            &qHeads[0][0][0],
-#endif
-#endif
-            attentionSinksPtr,
 #if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
             cacheKHeads.get(), cacheVHeads.get(),
 #else
@@ -741,15 +793,125 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #if USE_PAGED_KV_CACHE
             pageListArg,
 #endif
-            maxSeqLen, &seqLenList[0][0],
-#if BEAM_WIDTH > 1
-            beamSearchParams,
-#endif
-            batchSize, kvCacheScale.get(),
+            maxSeqLen, &seqLenList[0][0], batchSize, kvCacheScale.get(), semaphores.get(), scratch, stream);
+    };
+#else
+    auto multiBlockNum = [&]()
+    {
+        auto const calcFunc = useQGMMA ? &computeNbSubSeqPerSeqHopperF8MHA : &computeNbSubSeqPerSeqMHA;
+        return calcFunc(prop, batchSize, nbKHeads, maxSeqLen);
+    }();
+    auto runKernel = [&]()
+    {
 #if SPEC_DEC
-            specDecParams,
+        SpecDecParams const specDecParams{.qSeqLen = qSeqLen,
+            .qCuSeqLens = reinterpret_cast<uint32_t const*>(deviceCuQSeqLen),
+            .mask = reinterpret_cast<MaskType const*>(devicePackedMask)};
 #endif
-            semaphores.get(), scratch, stream);
+        if (useQGMMA)
+        {
+            launchHopperF8MHA(prop, nbKHeads,
+#if SLIDING_WINDOW
+                slidingWinSize,
+#endif
+                qScale,
+#if SPEC_DEC
+                &output[0][0][0][0],
+#else
+                &output[0][0][0],
+#endif
+#if LOW_PREC_OUTPUT
+                rcpOutScale.get(),
+#endif
+#if USE_INPUT_KV
+                &qkvHeads[0][0][0],
+#if ROPE_STYLE != 0
+                ropeCosSin.get(),
+#endif
+#else
+#if SPEC_DEC
+                &qHeads[0][0][0][0],
+#else
+                &qHeads[0][0][0],
+#endif
+#endif
+                attentionSinksPtr,
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+                cacheKHeads.get(), cacheVHeads.get(),
+#else
+                cacheHeads.get(),
+#endif
+#if USE_PAGED_KV_CACHE
+                pageListArg,
+#endif
+                maxSeqLen, &seqLenList[0][0],
+#if BEAM_WIDTH > 1
+                beamSearchParams,
+#endif
+                batchSize, kvCacheScale.get(),
+#if SPEC_DEC
+                specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+                skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+                kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
+#endif
+#endif
+                semaphores.get(), scratch, stream);
+        }
+        else
+        {
+            launchMHA(prop, nbKHeads,
+#if SLIDING_WINDOW
+                slidingWinSize,
+#endif
+                qScale,
+#if SPEC_DEC
+                &output[0][0][0][0],
+#else
+                &output[0][0][0],
+#endif
+#if LOW_PREC_OUTPUT
+                rcpOutScale.get(),
+#endif
+#if USE_INPUT_KV
+                &qkvHeads[0][0][0],
+#if ROPE_STYLE != 0
+                fullHeadRopeCosSin.get(),
+#endif
+#else
+#if SPEC_DEC
+                &qHeads[0][0][0][0],
+#else
+                &qHeads[0][0][0],
+#endif
+#endif
+                attentionSinksPtr,
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+                cacheKHeads.get(), cacheVHeads.get(),
+#else
+                cacheHeads.get(),
+#endif
+#if USE_PAGED_KV_CACHE
+                pageListArg,
+#endif
+                maxSeqLen, &seqLenList[0][0],
+#if BEAM_WIDTH > 1
+                beamSearchParams,
+#endif
+                batchSize, kvCacheScale.get(),
+#if SPEC_DEC
+                specDecParams,
+#endif
+#if SKIP_SOFTMAX_ATTN
+                skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+                kernelSkippedBlockCount.get(), kernelTotalBlockCount.get(),
+#endif
+#endif
+                semaphores.get(), scratch, stream);
+        }
         checkCuda(cudaGetLastError());
     };
 #endif
@@ -785,12 +947,22 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     checkCuda(cudaEventRecord(toc, stream));
     prefetchToDevice(cudaCpuDeviceId);
     checkCuda(cudaStreamSynchronize(stream));
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    kernelSkippedBlockCount[0] /= nbIters;
+    kernelTotalBlockCount[0] /= nbIters;
+#endif
     if (testPerf)
     {
         float ms;
         checkCuda(cudaEventElapsedTime(&ms, tic, toc));
         ms /= nbIters;
+#if CUDA_VERSION >= 13000
+        int memoryClockRateKHz;
+        checkCuda(cudaDeviceGetAttribute(&memoryClockRateKHz, cudaDevAttrMemoryClockRate, device));
+        float const bandwidth = 2.f * prop.memoryBusWidth * memoryClockRateKHz * 1000 / 8;
+#else
         float const bandwidth = 2.f * prop.memoryBusWidth * prop.memoryClockRate * 1000 / 8;
+#endif
 #if BEAM_WIDTH == 1
         size_t nbLoadedCacheTokens = seqLen * beamWidth * batchSize;
 #else
@@ -815,17 +987,36 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
             = totalNbCacheLoadBytes + inputBytes + outputBytes; // we ignore page indices and beam search indices.
         float const dramSolTime = totalTraffic / bandwidth * 1E3f;
         float const dramSolRatio = dramSolTime / ms;
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        size_t const totalNbCacheLoadWithSkip = gmemCacheHeadBytes
+            * (nbKHeads + nbVHeads * (1 - 1.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]))
+            * nbLoadedCacheTokens;
+        float const totalTrafficWithSkip
+            = totalNbCacheLoadWithSkip + inputBytes + outputBytes; // we ignore page indices and beam search indices.
+        float const dramSolTimeWithSkip = totalTrafficWithSkip / bandwidth * 1E3f;
+        float const dramSolRatioWithSkip = dramSolTimeWithSkip / ms;
+#endif
         if (verbose)
         {
             printf("done\n");
             printf("time: %f ms\n", ms);
+#if CUDA_VERSION >= 13000
+            printf("mem bus width = %d\nmem clock rate = %d\n", prop.memoryBusWidth, memoryClockRateKHz);
+#else
             printf("mem bus width = %d\nmem clock rate = %d\n", prop.memoryBusWidth, prop.memoryClockRate);
+#endif
             printf("bandwidth = %e\n", (float) bandwidth);
             printf("traffic=%e\n", (float) totalTraffic);
         }
         float const tops = headGrpSize * qSeqLen * float(seqLen) * (validElemsPerKHead + validElemsPerVHead) * 2
             * nbKHeads * batchSize / (ms * 1E-3F) * 1E-12F;
+#if SKIP_SOFTMAX_ATTN && SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        printf("kernel skippedBlockCount: %d/%d (%.2f%%)\n", kernelSkippedBlockCount[0], kernelTotalBlockCount[0],
+            kernelTotalBlockCount[0] == 0 ? 0.0f : 100.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]);
+        printf("dramSolRatioWithSkip: %f%% (%f ms, TOPS = %f)\n", dramSolRatioWithSkip * 100, ms, tops);
+#else
         printf("dramSolRatio: %f%% (%f ms, TOPS = %f)\n", dramSolRatio * 100, ms, tops);
+#endif
     }
     if (refCheck)
     {
@@ -1034,20 +1225,20 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 
 #endif
 #endif
+                        auto const refAttentionSinks
+                            = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
 #if SPEC_DEC
                         Eigen::Matrix<float, runtimeHeadGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
                         refOutput = refAttention<InputElem>(&qHeads[req][b][q_len][runtimeHeadGrpSize * idxKHead],
                             kCacheSeq, vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
-                            hostMask, qSeqLen, q_len);
+                            refAttentionSinks, hostMask, qSeqLen, q_len);
 #else
                     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refOutput;
-                    auto const refAttentionSinks
-                        = hasAttentionSinks ? attentionSinksPtr + headGrpSize * idxKHead : nullptr;
                     if (useQGMMA)
                     {
                         refOutput = refFlashAttention<CacheElem, 64>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
-                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize,
-                            refAttentionSinks);
+                            vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize, refAttentionSinks,
+                            skipSoftmaxThresholdScaleFactor, &skippedBlockCount, &totalBlockCount, multiBlockNum);
                         // refOutput = refAttention<CacheElem>(&qHeads[req][b][headGrpSize * idxKHead], kCacheSeq,
                         // vCacheSeq, seqLen, qScaleForRef, kvCacheScale[0], xScale, slidingWinSize);
                     }
@@ -1094,6 +1285,14 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
 #endif
             }
         }
+#if SKIP_SOFTMAX_ATTN
+        printf("host skippedBlockCount: %d/%d (%.2f%%)\n", skippedBlockCount, totalBlockCount,
+            totalBlockCount == 0 ? 0.0f : 100.0f * skippedBlockCount / totalBlockCount);
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+        printf("kernel skippedBlockCount: %d/%d (%.2f%%)\n", kernelSkippedBlockCount[0], kernelTotalBlockCount[0],
+            kernelTotalBlockCount[0] == 0 ? 0.0f : 100.0f * kernelSkippedBlockCount[0] / kernelTotalBlockCount[0]);
+#endif
+#endif
         if (saveData)
         {
             fout_refOutput.close();
@@ -1161,6 +1360,21 @@ TEST(RefCheck, llama_V2_70b_3)
 
 #endif
 }
+
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+TEST(RefCheck, gpt_oss_spec_swa_rows)
+{
+    runTest<8, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 4>(1, 260, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 2>(4, 258, false, true, true, false, true, ~0U, 128);
+    runTest<8, HEAD_GROUP_SIZE, 4>(4, 260, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 2>(1, 258, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 4>(1, 260, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 2>(4, 258, false, true, true, false, true, ~0U, 128);
+    runTest<2, HEAD_GROUP_SIZE, 4>(4, 260, false, true, true, false, true, ~0U, 128);
+}
+#endif
+
 #endif
 
 #else
@@ -1215,6 +1429,14 @@ TEST(RefCheck, llama_V2_70b)
 #if SLIDING_WINDOW
     runTest<2>(2, 4096, false, true, false, false, false, ~0, 256);
     runTest<2>(2, 400, false, true, false, false, false, ~0U, 256);
+#endif
+#if SKIP_SOFTMAX_ATTN
+    runTest<1>(32, 2048, false, true, false, false, false, ~0U, 1U << 30, 0.f);
+    runTest<4>(32, 1538, false, true, false, false, false, ~0U, 1U << 30, 1280.f);
+    runTest<2>(32, 4096, false, true, false, false, false, ~0U, 1U << 30, 125.f);
+    runTest<4>(32, 300, false, true, false, false, false, ~0U, 1U << 30, 80.f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 501.0f);
+    runTest<4>(32, 500, false, true, false, false, false, ~0U, 1U << 30, 500.f);
 #endif
     runTest<8>(120, 367, false, true);
     runTest<8>(1792, 2048, false, true);
@@ -1369,9 +1591,9 @@ TEST(NVRTC, compile)
         "gmma.cuh", "gmma_impl.cuh", "barriers.cuh", "tma.h", "cuda_bf16.h", "cuda_bf16.hpp", "cuda_fp16.h",
         "cuda_fp16.hpp", "cuda_fp8.h", "cuda_fp8.hpp", "vector_types.h", "vector_functions.h", "device_types.h"};
     assert(headers_content.size() == headers_name.size());
-    auto test
-        = [&](int input_fp16, int cache_enum, int head_dim, int head_grp_size, bool use_paged_kv_cache,
-              int paged_kv_cache_layout, int beam_width, char const* source_file, int compileMajor, int compileMinor)
+    auto test = [&](int input_fp16, int cache_enum, int head_dim, int head_grp_size, bool use_paged_kv_cache,
+                    int paged_kv_cache_layout, int beam_width, char const* source_file, int compileMajor,
+                    int compileMinor, int rope_elems = 0)
     {
         std::string arch_flag = "-arch=sm_" + std::to_string(compileMajor) + std::to_string(compileMinor);
         if ((compileMajor == 9 || compileMajor == 10 || compileMajor == 12) && compileMinor == 0)
@@ -1403,6 +1625,7 @@ TEST(NVRTC, compile)
             options.push_back("-DROPE_STYLE=1");
             options.push_back("-DSLIDING_WINDOW=1");
             options.push_back("-DLOW_PREC_OUTPUT=1");
+            options.push_back("-DROPE_ELEMS=" + std::to_string(rope_elems != 0 ? rope_elems : head_dim));
         }
         std::vector<char const*> options_cstr;
         for (auto const& option : options)
@@ -1482,6 +1705,14 @@ TEST(NVRTC, compile)
                                 }
                                 test(input_fp16, cache_enum, head_dim, 8, use_paged_kv_cache, paged_kv_cache_layout,
                                     beam_width, source_file, major, minor);
+                                // Verify the partial-rotary in-kernel RoPE path also compiles (rope dim
+                                // = head_dim/2, a 16-multiple for these head dims) on the sm90 fused path.
+                                if (source_file == tensorrt_llm::kernels::mha_sm90_cu_content && cache_enum == 2
+                                    && (head_dim / 2) % 16 == 0)
+                                {
+                                    test(input_fp16, cache_enum, head_dim, 8, use_paged_kv_cache, paged_kv_cache_layout,
+                                        beam_width, source_file, major, minor, head_dim / 2);
+                                }
                             }
                         }
                     }
@@ -1489,6 +1720,19 @@ TEST(NVRTC, compile)
             }
         }
     }
+}
+#endif
+#endif
+
+#if SLIDING_WINDOW && USE_PAGED_KV_CACHE && !IS_MLA
+#if !SPEC_DEC || (!IS_SPEC_DEC_TREE && !defined(SPEC_Q_SEQ_LEN))
+TEST(RefCheck, sliding_window_invalid_prefix_pages)
+{
+#if SPEC_DEC
+    runTest<1, HEAD_GRP_SIZE, 3>(16, 256 + 57, false, true, false, false, false, ~0U, 128);
+#else
+    runTest<1>(16, 256 + 57, false, true, false, false, false, ~0U, 128);
+#endif
 }
 #endif
 #endif

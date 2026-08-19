@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 template <bool DoSoftmaxBeforeTopK>
@@ -33,8 +35,9 @@ std::tuple<at::Tensor, at::Tensor> custom_moe_routing_op(
     int64_t num_tokens = input_size[0];
     int64_t num_experts = input_size[1];
     TORCH_CHECK(input_size.size() == 2, "router_logits must be a 2D Tensor");
-    TORCH_CHECK(topk <= 8, "topk should be smaller than or equal to 8 for now"); //@todo: remove this restriction later
-    TORCH_CHECK(num_experts <= 128, "expert number should be smaller than or equal to 128 for now");
+    TORCH_CHECK(
+        topk <= 16, "topk should be smaller than or equal to 16 for now"); //@todo: remove this restriction later
+    TORCH_CHECK(num_experts <= 512, "expert number should be smaller than or equal to 512 for now");
 
     // Determine output data type
     at::ScalarType topk_values_dtype = output_dtype.value_or(torch::kFloat32);
@@ -121,6 +124,8 @@ std::tuple<at::Tensor, at::Tensor> default_moe_routing_op(
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -130,7 +135,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("renorm_moe_routing_op", &torch_ext::renorm_moe_routing_op);
+    m.impl("renorm_moe_routing_op", &tensorrt_llm::torch_ext::renorm_moe_routing_op);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -142,5 +147,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("default_moe_routing_op", &torch_ext::default_moe_routing_op);
+    m.impl("default_moe_routing_op", &tensorrt_llm::torch_ext::default_moe_routing_op);
 }

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import pathlib
@@ -27,6 +30,11 @@ mpi4py.MPI.pickle.__init__(
 # needed since we reuse the mpi executor pool, first test running will leak a thread
 pytestmark = pytest.mark.threadleak(enabled=False)
 
+# Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder
+# ``AttentionMetadata`` is sized once at load to this maximum; each forward
+# re-preps it with the real per-image sequence lengths.
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
+
 
 def make_pixtral_vision_config():
     # Values taken from:
@@ -35,7 +43,7 @@ def make_pixtral_vision_config():
         pretrained_config=transformers.PixtralVisionConfig(
             hidden_size=1024,
             num_attention_heads=16,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             hidden_act="silu",
         ),
     )
@@ -56,10 +64,9 @@ def init_hf_model(cls, config, dtype, device):
     Instead, we lazily instantiate the model, and initialize the weights only after moving it to
     the requested `device`.
     """
-    from transformers import modeling_utils as t_modeling_utils
-
-    with t_modeling_utils.no_init_weights():
-        model = cls(config).eval()
+    # transformers 5.x removed ``no_init_weights``; weights are initialized lazily
+    # via ``model.init_weights()`` below instead.
+    model = cls(config).eval()
 
     model.to(device=device)
     model.init_weights()
@@ -79,6 +86,8 @@ def test_pixtral_vision_model_vs_hf():
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to(device)
     )
+    # Engine normally calls this after model load; standalone tests must do it themselves.
+    pixtral_model.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
     hf_pixtral_model = init_hf_model(
         cls=hf_modeling_pixtral.PixtralVisionModel,
         config=pretrained_config,
@@ -135,6 +144,7 @@ def test_tensor_parallelism(mpi_pool_executor, tmp_path):
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )
+    pixtral_model.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
     pixtral_model.load_weights(state_dict)
     # Save the number of params to check that the model gets shared in the workers.
     num_params = sum(p.numel() for p in pixtral_model.parameters())
@@ -205,6 +215,7 @@ def _run_pixtral_and_compare_against_ref(
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )
+    pixtral_model.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
     state_dict = torch.load(hf_weights_path, map_location="cuda")
     pixtral_model.load_weights(state_dict)
 

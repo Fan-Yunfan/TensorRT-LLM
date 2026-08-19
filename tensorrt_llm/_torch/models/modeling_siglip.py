@@ -2,16 +2,18 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)
 
+from tensorrt_llm._utils import prefer_pinned
+
 from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_clip import CLIPEncoder
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl, register_auto_model
 
 SiglipEncoder = CLIPEncoder
@@ -65,7 +67,7 @@ class SiglipVisionTransformer(nn.Module):
 
 
 @register_auto_model("SiglipVisionModel")
-class SiglipVisionModel(nn.Module):
+class SiglipVisionModel(nn.Module, MultimodalEncoderMixin):
 
     def __init__(self,
                  model_config: ModelConfig[SiglipVisionConfig],
@@ -75,6 +77,11 @@ class SiglipVisionModel(nn.Module):
         self.vision_model = SiglipVisionTransformer(
             model_config, use_post_layernorm=use_post_layernorm)
         self.model_config = model_config
+
+        # Needed for prepare_attn_metadata
+        self.image_size = self.config.image_size
+        self.patch_size = self.config.patch_size
+
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
 
@@ -83,21 +90,20 @@ class SiglipVisionModel(nn.Module):
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
         """
-        seq_len = (self.config.image_size // self.config.patch_size)**2
+        seq_len = (self.image_size // self.patch_size)**2
         request_ids = list(range(1, batch_size + 1))
         prompt_lens = [seq_len] * batch_size
-        attn_metadata = self.metadata_cls(
-            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
-            num_contexts=batch_size,
-            max_num_requests=batch_size,
-            max_num_tokens=seq_len * batch_size,
-            kv_cache_manager=None,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-        )
-        attn_metadata.max_seq_len = seq_len * batch_size
-        attn_metadata.prepare()
-        return attn_metadata
+        seq_lens = torch.tensor([seq_len] * batch_size,
+                                dtype=torch.int,
+                                pin_memory=prefer_pinned())
+
+        self.attn_metadata.num_contexts = batch_size
+        self.attn_metadata.request_ids = request_ids
+        self.attn_metadata.prompt_lens = prompt_lens
+        self.attn_metadata.seq_lens = seq_lens
+        self.attn_metadata.max_seq_len = seq_len
+        self.attn_metadata.prepare()
+        return self.attn_metadata
 
     @property
     def dtype(self):

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,8 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // Maximum number of CTAs in the batch-token dimension.
+    // Maximum number of batched-dimension entries. The legacy CTA-based name is kept for interface
+    // compatibility even though routed MoE paths may count these entries at CGA granularity.
     static constexpr int MaxNumCtas = 2048;
 
     //
@@ -38,10 +39,16 @@ struct KernelParams
     // makeTmaShapeStrideAbc.
     //
     // If batchM:
-    //    Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
-    //    Logical strides are [K, 1].
-    //    Tile box shape is [tileM, tileK].
-    //    Tile box strides are [tileK, 1].
+    //    If batchStrideInTokens > 0:
+    //       Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileM, tileK].
+    //       Tile box strides are [tileK, 1].
+    //    Else // batchStrideInTokens == 0:
+    //       Logical shape is [M, K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileM, tileK].
+    //       Tile box strides are [tileK, 1].
     //
     // If batchN:
     //    If layoutA is MatrixLayout::MajorK
@@ -87,10 +94,16 @@ struct KernelParams
     //       where blockK is 128B.
     //
     // If batchN:
-    //    Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
-    //    Logical strides are [K, 1].
-    //    Tile box shape is [tileN, tileK].
-    //    Tile box strides are [tileK, 1].
+    //    If batchStrideInTokens > 0:
+    //       Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileN, tileK].
+    //       Tile box strides are [tileK, 1].
+    //    Else // batchStrideInTokens == 0:
+    //       Logical shape is [N, K].
+    //       Logical strides are [K, 1].
+    //       Tile box shape is [tileN, tileK].
+    //       Tile box strides are [tileK, 1].
     //
     // Dtype is set from options.mDtypeB.
     CUtensorMap tmaB[1];
@@ -157,6 +170,24 @@ struct KernelParams
     // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
     CUtensorMap tmaSfB[1];
 
+    // TMA descriptor for the sparsity information of A, if structured sparsity is used.
+    // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+    // makeTmaShapeStrideSparsityInfoA.
+    //
+    // When sparsityA is Any_2_4:
+    //     2 elements are non-zero in any chunk of 4 elements.
+    //     A 4-bit index indicates the position of the non-zero elements.
+    //     The shape in UInt8 is: [B, M, K / 8]
+    //
+    // When sparsityA is Pairwise_4_8:
+    //     4 elements are non-zero in any chunk of 8 elements.
+    //     The zero and non-zero elements are grouped in pairs.
+    //     A 4-bit index indicates the position of the non-zero pairs.
+    //     The shape in UInt8 is: [B, M, K / 16]
+    //
+    // Dtype is Dtype::UInt8.
+    CUtensorMap tmaSparsityInfoA;
+
     // The input matrix A.
     // If (routeAct == true && batchM), the shape is [M, K]. tmaA is not used.
     // Otherwise, check layout of tmaA to see the shape and strides.
@@ -176,6 +207,26 @@ struct KernelParams
 
     // The output matrix C. Check "logical" layout of tmaC to see the shape and strides.
     void* ptrC{nullptr};
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    //
+    // MoE (Mixture of Experts) finalize parameters for direct register-to-gmem store.
+    //
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Mapping from permuted token index to expanded token index.
+    // Used in MoE finalize to map the batch dimension back to the original token order.
+    // Shape is [numTokens * topK] where topK is the number of experts per token.
+    // Value of -1 indicates an invalid/padded entry that should be skipped.
+    // The dtype is int32_t.
+    int32_t const* permutedIdxToExpandedIdx{nullptr};
+
+    // Expert weights (routing probabilities) for each expanded token.
+    // Used in MoE finalize to scale the output by the expert's routing weight.
+    // Shape is [numTokens * topK].
+    // The dtype matches the output dtype (typically bfloat16 or float16).
+    // Can be nullptr if no expert weighting is needed.
+    void const* expertWeightsPtr{nullptr};
 
     // Inputs and output are MxFp{4,8}, Fp8, NvFp4.
     // The scaling factors to apply to the output - can be used to incorporate input scaling factors
@@ -197,6 +248,13 @@ struct KernelParams
     // TensorRT-LLM API requires a scaling factor on the device.
     // Shape is [B]. One scaling factor per tensor in batch.
     float const* ptrScaleC{nullptr};
+
+    // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
+    // activation.
+    // Only used when non-linear activation is applied (e.g., GELU, Relu2, Silu).
+    // When used, scaleC should be quantScaleC only, and this scale is applied before the
+    // activation. Shape is [B].
+    float const* ptrScaleAct{nullptr};
 
     // The output gate scale for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
     // TensorRT-LLM API requires a scaling factor on the device.
@@ -279,8 +337,7 @@ struct KernelParams
     //
     // This is used for either:
     //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
-    //   * When the routing scales are applied to the input activations (only when output is not
-    //   transposed). The dtype is Dtype::Bfloat16
+    //   * One-sided per-token scaling. The dtype is Dtype::Bfloat16 by default.
     //
     // if (batchM (A is activations)):
     //     Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B)]
@@ -294,8 +351,7 @@ struct KernelParams
     //
     // This is used for either:
     //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
-    //   * When the routing scales are applied to the input activations (only when output is
-    //   transposed). The dtype is Dtype::Bfloat16
+    //   * One-sided per-token scaling. The dtype is Dtype::Bfloat16 by default.
     //
     // if (batchM (B is weights)):
     //     Logical shape is [B, divUpMul(N, tileN)]
@@ -313,11 +369,41 @@ struct KernelParams
     // If batchM, BiasType must be N, and bias shape is [B, N].
     // The bias is broadcasted along the M dimension.
     //
-    // If batchNm BiasType must be M, and bias shape is [B, M].
+    // If batchN, BiasType must be M, and bias shape is [B, M].
     // The bias is broadcasted along the N dimension.
+    //
+    // If BiasType is Mn, the bias is a full 2D matrix applied element-wise (D = A*B + C):
+    //   The row dimension is:
+    //     If batchM: sum(divUpMul(M[bi], tileM) for bi in B).
+    //     If batchN: sum(divUpMul(N[bi], tileN) for bi in B).
+    //   The hidden dimension is:
+    //     If batchM: N.
+    //     If batchN: M.
+    //   If options.mFusedBiasShuffleMode == gemm::FusedBiasShuffleMode::None, the buffer is
+    //   row-major after any fused-act interleave and after the shuffled-matrix reordering expected by
+    //   the epilogue.
+    //   If options.mFusedBiasShuffleMode == gemm::FusedBiasShuffleMode::Shuffle, the buffer is
+    //   row-major [biasRow, hidden] after any fused-act interleave, but before shuffled-matrix
+    //   reordering.
+    //   If options.mFusedBiasShuffleMode == gemm::FusedBiasShuffleMode::ReorderAndShuffle, the
+    //   buffer is row-major [biasRow, hidden] before both fused-act bias interleave and
+    //   shuffled-matrix reordering.
     //
     // The dtype is float32.
     void const* ptrBias{nullptr};
+
+    // Optional map from permuted padded row index in the batched dimension to the row index in
+    // ptrBias to load for BiasType::Mn.
+    //
+    // If this pointer is nullptr, ptrBias is interpreted directly in the permuted padded row-major
+    // layout described above, i.e. biasRow = permutedRow.
+    //
+    // If this pointer is non-null, the shape is
+    // [sum(divUpMul(M[bi], tileM) for bi in B)] for batchM or
+    // [sum(divUpMul(N[bi], tileN) for bi in B)] for batchN.
+    //
+    // The dtype is int32_t.
+    int32_t const* ptrPermutedIdxToBiasRowIdx{nullptr};
 
     // The output block scaling factors for C.
     //
@@ -400,13 +486,20 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // In some cases, some CTAs must early-exit. E.g. when the grid size is set statically, but the
-    // actual workload is decided at runtime. This element on the device contains the number of CTAs
+    // NOTE: The legacy CTA-based names below are kept for API backward compatibility. When the
+    // batched dimension is clustered, these fields describe one batched-dimension entry per CGA
+    // rather than per CTA. Specifically, ptrNumNonExitingCtas stores a CGA-granular count,
+    // ptr/ctaIdxXyTo* are looked up by CGA index, and ctasInTokenDimPerBatch / batchStrideInCtas
+    // count CGA entries per batch.
+
+    // In some cases, some CGAs must early-exit. E.g. when the grid size is set statically, but the
+    // actual workload is decided at runtime. This element on the device contains the number of CGAs
     // that do not early-exit. The number corresponds to the X dim of the grid when the output is not
     // transposed (i.e. batchM). To the Y dim, otherwise.
     // The size is 1 and the dtype is int32_t.
     // Used if isStaticBatch == false, otherwise set to nullptr.
     // The pointer points to a scalar and the dtype is int32_t. The pointed value must be >= 0.
+    // Legacy CTA-based name; stores a CGA-granular count when the batched dimension is clustered.
     int32_t const* ptrNumNonExitingCtas{nullptr};
 
     // Pointer to total number of padded tokens.
@@ -421,25 +514,29 @@ struct KernelParams
     // totalNumPaddedTokens is used.
     int32_t const* ptrTotalNumPaddedTokens{nullptr};
 
-    // Pointer to the map from the CTA index (in X/Y dim) to the batch index.
-    // Maps CTA index in batch dim (i.e. blockDim.x if batchM, otherwise blockDim.y)
-    // to batch index.
+    // Pointer to the map from the CGA index (in X/Y dim) to the batch index.
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     // E.g. with listM = 128,255,32 and tileM = 128, should be equal to
     // ctaIdxXyToBatchIdx = [0, 1, 1, 2]
     // If isStaticBatch == true, ptrCtaIdxXyToBatchIdx should be set to nullptr and ctaIdxXyToBatchIdx
     // is used.
     int32_t const* ptrCtaIdxXyToBatchIdx{nullptr};
 
-    // Pointer from the CTA index X/Y to the expanded tile index where the expanded tile index is
+    // Pointer from the CGA index X/Y to the expanded tile index where the expanded tile index is
     // computed as:
     //
     // int expandedIdx = 0;
-    // for (int bi = 0; bi < batchIdx-1; ++bi) {
-    //   expandIdx = divUpMul(numTokens[bi], TileM/N);
+    // for (int bi = 0; bi < batchIdx; ++bi) {
+    //   expandedIdx += divUpMul(numTokens[bi], cgaTileM/N);
     // }
-    // expandIdx += <index in the batch>
-    // E.g. with numTokens = [128,255,32] and tileM = 128, should be equal to
+    // ptrCtaIdxXyToMnLimit[cgaIdxXy] =
+    //   min(expandedIdx + (cgaIdxInBatch + 1) * cgaTileM/N, expandedIdx + numTokens[batchIdx]);
+    //
+    // E.g. with numTokens = [128,255,32] and cgaTileM/N = 128:
     // ptrCtaIdxXyToMnLimit = [128, 256, 383, 416]
+    // With cgaTileM/N = 256:
+    // ptrCtaIdxXyToMnLimit = [128, 511, 544]
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     int32_t const* ptrCtaIdxXyToMnLimit{nullptr};
 
     // Total number of padded tokens - used as the stride for the activation and C scaling factors.
@@ -447,16 +544,32 @@ struct KernelParams
     // If isStaticBatch == true, totalNumPaddedTokens is used, otherwise ptrTotalNumPaddedTokens.
     int32_t totalNumPaddedTokens;
 
-    // A map from CTA index X/Y to batch index.
+    // Total number of padded tokens - used as the stride for the output activation
+    // and C scaling factors. This is only used when isUniformNumTokensPerBatch is true.
+    int32_t totalNumOutputPaddedTokens;
+
+    // A map from CGA index X/Y to batch index.
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     // Check ptrCtaIdxXyToBatchIdx to see how it is computed.
     // If isStaticBatch == true, ctaIdxXyToBatchIdx is used, otherwise ptrCtaIdxXyToBatchIdx.
     int32_t ctaIdxXyToBatchIdx[MaxNumCtas];
 
     // **Expanded** limits for the batched dimension:
     //   tile * ctaIdxXyToTileIdxMn[ctaIdxXy] -> ctaIdxXyToMnLimit[ctaIdxXy]
+    // Legacy CTA-based name; looked up by CGA index when the batched dimension is clustered.
     // Check ptrCtaIdxXyToMnLimit to see how it is computed.
     // If isStaticBatch == true, ctaIdxXyToMnLimit is used, otherwise ptrCtaIdxXyToMnLimit.
     int32_t ctaIdxXyToMnLimit[MaxNumCtas];
+
+    // Total number of batched-dimension entries in the token dimension per batch.
+    // Used only when isUniformNumTokensPerBatch is true.
+    // Legacy CTA-based name; counts CGA entries per batch when the batched dimension is clustered.
+    int32_t ctasInTokenDimPerBatch{0};
+
+    // Stride for the batched dimension in the number of batched-dimension entries.
+    // Used only when isUniformNumTokensPerBatch is true.
+    // Legacy CTA-based name; counts CGA entries per batch when the batched dimension is clustered.
+    int32_t batchStrideInCtas{0};
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //
@@ -468,6 +581,14 @@ struct KernelParams
     int rank;
     // The number of peer devices in tensor-parallel group.
     int tpGrpSize;
+    // A barrier that is used to synchronize kernels running on multiple GPUs.
+    // UC is a unicast pointer in local GPU memory.
+    // MC is a multicast pointer to all other GPUs' memory.
+    //
+    // The value must be initialized to zero. The barrier is self-resetting. It
+    // does not have to be reset by another kernel after the grid has ended.
+    uint32_t* ptrMulticastCompletionBarUc;
+    uint32_t* ptrMulticastCompletionBarMc;
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //
@@ -492,6 +613,18 @@ struct KernelParams
     //
     // The memory must be set to 0 before the kernel launch.
     uint32_t* ptrRowMaxCompletionBars{nullptr};
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    //
+    // Dynamic tile scheduling parameters.
+    //
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Global counter for SW-emulated dynamic tile scheduling. When dynamic scheduling is enabled,
+    // Must be initialized to the number equal to the grid size before each kernel launch.
+    // Set to nullptr if static scheduling is used.
+    // Shape is [1].
+    uint32_t* ptrDynamicTileCounter{nullptr};
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

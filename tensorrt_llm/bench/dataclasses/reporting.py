@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
-from typing import Any, Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple, Optional
+
+import torch
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
 
 from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
@@ -35,6 +43,7 @@ class StatsKeeper:
     def __init__(self) -> None:
         self.requests: Dict[int, RequestRecord] = defaultdict(RequestRecord)
         self.num_complete: int = 0
+        self.total_energy: Optional[float] = None
 
     def register_request(
         self,
@@ -72,7 +81,64 @@ class StatsKeeper:
         if request_perf_item.response_is_final:
             self.num_complete = self.num_complete + 1
 
-    def generate_statistics_summary(self, max_draft_tokens: int) -> None:
+    def set_energy(self, energy: Optional[float]):
+        """Set the total energy for the benchmark."""
+        self.total_energy = energy
+
+    @staticmethod
+    def _compute_batch_full_output_throughput(
+            requests: List[RequestRecord], batch_size: int) -> Optional[float]:
+        """Estimate output token throughput while active requests fill a batch.
+
+        Request records do not carry per-token timestamps, so output tokens are
+        prorated uniformly over each request's start/end interval.  This keeps
+        the existing end-to-end throughput while adding a steady-state view that
+        excludes the final drain phase when active requests drop below
+        ``batch_size``.
+        """
+        if batch_size <= 0:
+            return None
+
+        events: Dict[int, tuple[int, float]] = {}
+        for request in requests:
+            start = request.start_timestamp
+            end = request.end_timestamp
+            if end <= start:
+                continue
+            token_rate = request.num_total_output_tokens / (end - start)
+            start_request_delta, start_rate_delta = events.get(start, (0, 0.0))
+            events[start] = (start_request_delta + 1,
+                             start_rate_delta + token_rate)
+            end_request_delta, end_rate_delta = events.get(end, (0, 0.0))
+            events[end] = (end_request_delta - 1, end_rate_delta - token_rate)
+
+        if not events:
+            return None
+
+        active_requests = 0
+        active_token_rate = 0.0
+        batch_full_duration_ns = 0
+        batch_full_output_tokens = 0.0
+        last_timestamp = None
+        for timestamp in sorted(events):
+            if (last_timestamp is not None and timestamp > last_timestamp
+                    and active_requests >= batch_size):
+                duration_ns = timestamp - last_timestamp
+                batch_full_duration_ns += duration_ns
+                batch_full_output_tokens += active_token_rate * duration_ns
+
+            request_delta, rate_delta = events[timestamp]
+            active_requests += request_delta
+            active_token_rate += rate_delta
+            last_timestamp = timestamp
+
+        if batch_full_duration_ns <= 0:
+            return None
+
+        return batch_full_output_tokens / batch_full_duration_ns
+
+    def generate_statistics_summary(self, max_draft_tokens: int,
+                                    batch_size: int) -> BenchmarkStatistics:
         """Generate summary statistics from internally stored statistics.
 
         Returns:
@@ -99,6 +165,7 @@ class StatsKeeper:
         num_accepted_draft_tokens = []
         draft_acceptance_rate = []
         acceptance_length = []
+        decoding_iterations = []
 
         for entry in self.requests.values():
             start_time = min(entry.start_timestamp, start_time)
@@ -127,6 +194,7 @@ class StatsKeeper:
                     float(num_draft_tokens[-1]))
                 acceptance_length.append(entry.num_total_output_tokens /
                                          (entry.decode_iteration + 1))
+                decoding_iterations.append(entry.decode_iteration + 1)
 
         global_acceptance_length = sum(
             output_tokens) / total_decoding_iterations
@@ -136,16 +204,32 @@ class StatsKeeper:
             num_draft_tokens) if num_draft_tokens else None
         num_accepted_draft_tokens_percentiles = PercentileStats.from_iterable(
             num_accepted_draft_tokens) if num_accepted_draft_tokens else None
+        # Weight the per-request acceptance rate (AR) and acceptance length
+        # (AL) averages by the number of decoding iterations the request ran.
+        # An equally-weighted mean would bias the result toward short requests,
+        # which run fewer decoding iterations; iteration weighting makes the
+        # .average a token-level mean so longer requests contribute
+        # proportionally. This also makes acceptance_length_percentiles.average
+        # equal the globally-computed acceptance_length
+        # (sum(output_tokens) / total_decoding_iterations), since AL_i =
+        # output_tokens_i / iterations_i and the weights cancel the per-request
+        # iterations. Percentiles are unaffected.
         draft_acceptance_rate_percentiles = PercentileStats.from_iterable(
-            draft_acceptance_rate) if draft_acceptance_rate else None
+            draft_acceptance_rate,
+            weights=decoding_iterations) if draft_acceptance_rate else None
         acceptance_length_percentiles = PercentileStats.from_iterable(
-            acceptance_length) if acceptance_length else None
+            acceptance_length,
+            weights=decoding_iterations) if acceptance_length else None
 
+        requests = list(self.requests.values())
         stats = BenchmarkStatistics(
             num_requests=num_requests,
             total_latency_ns=end_time - start_time,
             total_output_tokens=sum(output_tokens),
             total_input_tokens=total_input_tokens,
+            batch_full_output_throughput_tok_ns=self.
+            _compute_batch_full_output_throughput(requests, batch_size),
+            total_energy=self.total_energy,
             request_latency_percentiles=PercentileStats.from_iterable(
                 request_latencies),
             tpot_percentiles=PercentileStats.from_iterable(
@@ -195,8 +279,46 @@ class ReportUtility:
         self.kwargs = kwargs
         self.raw_statistics = statistics
         self.statistics = statistics.generate_statistics_summary(
-            self.get_max_draft_len())
+            self.get_max_draft_len(),
+            self.rt_cfg.settings_config.max_batch_size)
         self.streaming = streaming
+
+    def _query_gpu_info(self) -> Dict[str, Any]:
+        """Query first GPU info (all GPUs must be identical for TRT-LLM)."""
+        if not torch.cuda.is_available():
+            return None
+
+        try:
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+            physical_idx = int(
+                cuda_visible.split(",")[0].strip()) if cuda_visible else 0
+
+            props = torch.cuda.get_device_properties(physical_idx)
+            gpu_info = {
+                "name":
+                getattr(props, "name", "Unknown"),
+                "memory.total":
+                float(getattr(props, "total_memory", 0.0)) / (1024.0**3),
+                "clocks.mem":
+                None,
+            }
+            if pynvml:
+                try:
+                    # Memory clock information is not reported by torch, using NVML instead
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(physical_idx)
+                    clocks_mem = pynvml.nvmlDeviceGetMaxClockInfo(
+                        handle, pynvml.NVML_CLOCK_MEM) / 1000.0
+                    gpu_info["clocks.mem"] = clocks_mem
+                except pynvml.NVMLError as e:
+                    self.logger.info(
+                        f"Error querying GPU clock info with NVML: {e}")
+                    gpu_info["clocks.mem"] = None
+        except Exception as e:
+            # broad catch for any other errors, since this is a non-critical operation
+            self.logger.warning(f"Error querying GPU info: {e}")
+            return None
+        return gpu_info
 
     @staticmethod
     def convert_to_ms(ns: float) -> float:
@@ -222,6 +344,13 @@ class ReportUtility:
     def output_throughput_tok_s(self) -> float:
         """Output throughput in tokens per second."""
         return self.convert_rate_to_s(self.statistics.output_throughput_tok_ns)
+
+    @property
+    def batch_full_output_throughput_tok_s(self) -> Optional[float]:
+        """Estimated output throughput while active requests fill a batch."""
+        throughput = self.statistics.batch_full_output_throughput_tok_ns
+        return self.convert_rate_to_s(
+            throughput) if throughput is not None else None
 
     @property
     def total_token_throughput_tok_s(self) -> float:
@@ -269,9 +398,13 @@ class ReportUtility:
                 "model": self.rt_cfg.model,
                 "model_path": str(self.rt_cfg.model_path),
                 "engine_dir": str(self.rt_cfg.engine_dir),
+                "revision": self.rt_cfg.revision,
                 "version": self.rt_cfg.sw_version,
             },
         }
+
+        # Machine / GPU details - query only first GPU (all GPUs must be identical)
+        stats_dict["machine"] = self._query_gpu_info()
 
         # Retrieve KV cache information.
         kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
@@ -336,10 +469,10 @@ class ReportUtility:
 
         # World and runtime info
         stats_dict["world_info"] = {
-            "tp_size": self.rt_cfg.world_config.tp_size,
-            "pp_size": self.rt_cfg.world_config.pp_size,
-            "ep_size": self.rt_cfg.world_config.ep_size,
-            "world_size": self.rt_cfg.world_config.world_size,
+            "tp_size": self.rt_cfg.mapping["tp_size"],
+            "pp_size": self.rt_cfg.mapping["pp_size"],
+            "ep_size": self.rt_cfg.mapping["moe_ep_size"],
+            "world_size": self.rt_cfg.mapping["world_size"],
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
             "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
             "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
@@ -373,6 +506,9 @@ class ReportUtility:
             # Output throughput (total output (OSL) tokens / end-to-end latency)
             "system_output_throughput_tok_s":
             self.output_throughput_tok_s,
+            # Estimated output throughput while active requests fill a batch.
+            "batch_full_output_throughput_tok_s":
+            self.batch_full_output_throughput_tok_s,
             # Output throughput per user (average per request output throughput)
             "system_total_throughput_tok_s":
             self.total_token_throughput_tok_s,
@@ -380,7 +516,7 @@ class ReportUtility:
             self.per_user_output_throughput_tok_s,
             # Output throughput per GPU (total throughput / world size)
             "output_throughput_per_gpu_tok_s":
-            self.output_throughput_tok_s / self.rt_cfg.world_config.world_size,
+            self.output_throughput_tok_s / self.rt_cfg.mapping["world_size"],
             # Request latency percentiles
             "request_latency_percentiles_ms":
             self.statistics.request_latency_percentiles.model_dump(
@@ -390,6 +526,17 @@ class ReportUtility:
                     model_dump().items()
                 },
         }
+
+        if self.statistics.total_energy is not None:
+            stats_dict["energy"] = {
+                "total_energy_j":
+                self.statistics.total_energy,
+                "output_tps_per_w":
+                self.statistics.output_tps_per_w,
+                "average_gpu_power":
+                self.statistics.total_gpu_power /
+                self.rt_cfg.mapping["world_size"]
+            }
 
         if self.streaming:
             avg_tpot = self.convert_to_ms(
@@ -442,7 +589,12 @@ class ReportUtility:
               and self.kwargs["speculative_config"] is not None):
             # pytorch speculative decoding
             spec_decoding = True
-            decoding_mode = self.kwargs["speculative_config"].decoding_type
+            spec_config = self.kwargs["speculative_config"]
+            # Handle both dict (from YAML) and object types
+            if isinstance(spec_config, dict):
+                decoding_mode = spec_config.get("decoding_type")
+            else:
+                decoding_mode = spec_config.decoding_type
         if (spec_decoding):
             stats_dict["decoding_stats"] = {
                 "mode":
@@ -478,6 +630,7 @@ class ReportUtility:
         """
         stats_dict = self.get_statistics_dict()
         engine = stats_dict["engine"]
+        machine = stats_dict.get("machine")
         world_info = stats_dict["world_info"]
         requests = stats_dict["request_info"]
         perf = stats_dict["performance"]
@@ -498,6 +651,7 @@ class ReportUtility:
                 "===========================================================\n"
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
+                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
                 f"Engine Directory:\t{engine['engine_dir']}\n"
                 f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
@@ -509,10 +663,11 @@ class ReportUtility:
         else:
             backend_info = (
                 "\n\n===========================================================\n"
-                "= PYTORCH BACKEND\n"
+                f"= {self.rt_cfg.backend.upper()} BACKEND\n"
                 "===========================================================\n"
                 f"Model:\t\t\t{engine['model']}\n"
                 f"Model Path:\t\t{engine['model_path']}\n"
+                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
                 f"TensorRT LLM Version:\t{engine['version']}\n"
                 f"Dtype:\t\t\t{engine['dtype']}\n"
                 f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
@@ -525,6 +680,20 @@ class ReportUtility:
         kv_cache_percentage = world_info.get("kv_cache_percentage", None)
         if kv_cache_percentage is not None:
             kv_cache_percentage = f"{kv_cache_percentage * 100.0:.2f}%"
+
+        machine_info = (
+            "===========================================================\n"
+            "= MACHINE DETAILS \n"
+            "===========================================================\n")
+        if machine is None:
+            machine_info += "No GPU info available\n\n"
+        else:
+            name = machine.get("name", "Unknown")
+            mem_total_str = f"{machine['memory.total']:.2f} GB" if machine.get(
+                "memory.total") is not None else "N/A"
+            mem_clock_str = f"{machine['clocks.mem']:.2f} GHz" if machine.get(
+                'clocks.mem') is not None else "N/A"
+            machine_info += f"{name}, memory {mem_total_str}, {mem_clock_str}\n\n"
 
         world_info = (
             "===========================================================\n"
@@ -559,9 +728,15 @@ class ReportUtility:
             "= PERFORMANCE OVERVIEW \n"
             "===========================================================\n")
 
+        batch_full_output_throughput = perf[
+            "batch_full_output_throughput_tok_s"]
+        batch_full_output_throughput_text = (
+            f"{batch_full_output_throughput:.4f}"
+            if batch_full_output_throughput is not None else "N/A")
         perf_stats = (
             f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
             f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
+            f"Batch-Full Output Throughput (tokens/sec):        {batch_full_output_throughput_text}\n"
             f"Total Token Throughput (tokens/sec):              {perf['system_total_throughput_tok_s']:.4f}\n"
             f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
             f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
@@ -598,6 +773,15 @@ class ReportUtility:
                 f"{ttft_stats}\n"
                 "\n-- Per-Request Generation Throughput [GTPS] Breakdown (tps/user)\n\n"
                 f"{gen_tps_stats}\n")
+
+        if "energy" in stats_dict:
+            energy = stats_dict["energy"]
+            perf_stats += (
+                "\n-- Energy Metrics --------------------------------------\n\n"
+                f"Total Energy (J):                                 {energy['total_energy_j']:.4f}\n"
+                f"Output Tokens per Second per Watt (tps/W):         {energy['output_tps_per_w']:.4f}\n"
+                f"Average GPU Power (W):                            {energy['average_gpu_power']:.4f}\n"
+            )
 
         perf_stats += (
             "\n-- Request Latency Breakdown (ms) -----------------------\n\n"
@@ -663,6 +847,7 @@ class ReportUtility:
                 )
 
         logging_info = (f"{backend_info}"
+                        f"{machine_info}"
                         f"{request_info}"
                         f"{world_info}"
                         f"{perf_header}"
@@ -677,6 +862,11 @@ class ReportUtility:
         # Try to get from speculative_config
         if ("speculative_config" in self.kwargs
                 and self.kwargs["speculative_config"] is not None):
-            return self.kwargs["speculative_config"].max_draft_len or 0
+            spec_config = self.kwargs["speculative_config"]
+            # Handle both dict (from YAML) and object types
+            if isinstance(spec_config, dict):
+                draft_len = spec_config.get("max_draft_len")
+                return draft_len or 0
+            return spec_config.max_draft_len or 0
 
         return 0

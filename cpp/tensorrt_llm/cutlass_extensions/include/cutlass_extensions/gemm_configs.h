@@ -24,10 +24,11 @@
 
 #include "cute/tensor.hpp"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace cutlass_extensions
 {
 
@@ -359,7 +360,13 @@ struct CutlassGemmConfig
         BLACKWELL = 1u << 4,
         GROUPED_GEMM = 1u << 5,
         FP8_ONLY = 1u << 6,
-        FP4_ONLY = 1u << 7
+        FP4_ONLY = 1u << 7,
+        FP8FP4_MIXED = 1u << 8,
+        // MXFP8xMXFP8 block-scaled MoE on SM100/103. Restricts the candidate
+        // tile shapes to the subset valid for the Mxf8f6f4 tensor-op (TileM=128,
+        // TileN in {64,128,256}); otherwise autotuning would enumerate FP8 tile
+        // shapes that the runtime dispatcher rejects.
+        MXFP8_MXFP8 = 1u << 9
     };
 
     CutlassTileConfig tile_config_sm80 = CutlassTileConfig::ChooseWithHeuristic;
@@ -534,4 +541,5 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
 }
 
 } // namespace cutlass_extensions
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

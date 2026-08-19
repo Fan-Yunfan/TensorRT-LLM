@@ -6,17 +6,17 @@ import pytest
 import torch
 
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
-from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
+from utils.util import skip_single_gpu
 # isort: on
 
-from tensorrt_llm._torch.pyexecutor.config import update_executor_config
 from tensorrt_llm.executor.base_worker import BaseWorker
-from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -24,15 +24,78 @@ default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
 
 
+@pytest.mark.cpu_only
+def test_enqueue_request_wraps_lora_load_error():
+
+    class LoraManager:
+
+        def is_adapter_in_cpu_cache(self, adapter_id):
+            return False
+
+    def raise_load_error(lora_request):
+        raise RuntimeError("bad adapter")
+
+    worker = object.__new__(BaseWorker)
+    # GC-time __del__ -> shutdown() reads this; __init__ is bypassed here, so
+    # seed it to keep teardown a clean no-op.
+    worker.doing_shutdown = False
+    worker._lora_manager = LoraManager()
+    worker._load_lora_adapter = raise_load_error
+    request = type(
+        "Request", (), {
+            "id": 1,
+            "lora_request": type("LoraRequest", (), {"adapter_id": 999})(),
+        })()
+
+    with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
+        worker._enqueue_request(request)
+
+
+def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
+    missing_path = str(tmp_path / "private-lora-path")
+
+    request = LoRARequest("missing", 1, missing_path)
+
+    assert request.path == missing_path
+
+
+def create_fake_executor_config(engine_path, tp_size: int = 1):
+    """Create TorchLlmArgs and executor_config for testing.
+
+    Args:
+        engine_path: Path to the model
+        tp_size: Tensor parallel size
+
+    Returns:
+        Tuple of (llm_args, executor_config)
+    """
+    llm_args = TorchLlmArgs(
+        model=engine_path,
+        tensor_parallel_size=tp_size,
+        backend='pytorch',
+        enable_iter_perf_stats=True,
+        max_seq_len=2048,  # Set reasonable max sequence length
+        max_batch_size=8,  # Set reasonable batch size for tests
+        max_num_tokens=2048,  # Set reasonable max tokens
+    )
+    # executor_config is not needed for PyTorch backend
+    executor_config = None
+    return llm_args, executor_config
+
+
 class FakeWorker(BaseWorker):
 
     def __init__(self, engine: str, tp_size: int = 1):
-        llm_args, executor_config = create_fake_executor_config(engine, tp_size)
+        llm_args = TorchLlmArgs(
+            model=model_path,
+            tensor_parallel_size=tp_size,
+            backend='pytorch',
+            enable_iter_perf_stats=True,
+        )
         super().__init__(
             engine=engine,
             llm_args=llm_args,
             hf_model_dir=engine,
-            executor_config=executor_config,
         )
         # Note: BaseWorker doesn't call setup_engine() automatically,
         # unlike GenerationExecutorWorker, so we need to call it manually
@@ -115,31 +178,6 @@ class TestWorkerBase:
             assert timeout / 2 <= elapsed <= timeout * 2, f"Latency out of expected range: {elapsed}"
 
 
-def create_fake_executor_config(model_path, tp_size=1):
-    # Use TorchLlmArgs for PyTorch backend tests
-    llm_args = TorchLlmArgs(model=model_path,
-                            tensor_parallel_size=tp_size,
-                            backend='pytorch')
-
-    executor_config = tllm.ExecutorConfig(1)
-    executor_config.max_batch_size = 1
-    executor_config.model_world_size = tp_size
-
-    update_executor_config(
-        executor_config,
-        pytorch_backend_config=llm_args.get_pytorch_backend_config(),
-        mapping=llm_args.parallel_config.to_mapping(),
-        speculative_config=llm_args.speculative_config,
-        hf_model_dir=model_path,
-        max_input_len=20,
-        max_seq_len=40,
-        checkpoint_format=llm_args.checkpoint_format,
-        checkpoint_loader=llm_args.checkpoint_loader,
-    )
-
-    return llm_args, executor_config
-
-
 class TestRpcWorkerBaseTP2:
 
     def setup_method(self):
@@ -150,9 +188,13 @@ class TestRpcWorkerBaseTP2:
         self.session = self.create_worker_session()
 
     def create_worker_session(self):
-        session = MpiPoolSession(n_workers=2)
+        # wait_shutdown: block shutdown until the workers exited, so a test
+        # handed a live pool right after this one cannot race the GPU release.
+        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
         return session
 
+    @pytest.mark.gpu2
+    @skip_single_gpu
     def test_create_executor(self):
         futures = self.session.submit(
             TestRpcWorkerBaseTP2.create_executor,

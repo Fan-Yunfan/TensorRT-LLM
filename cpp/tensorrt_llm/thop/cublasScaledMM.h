@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,11 @@
 #include <optional>
 #include <torch/extension.h>
 
+#include "tensorrt_llm/common/config.h"
+
 namespace th = torch;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -29,8 +33,10 @@ th::Tensor cublas_mm(th::Tensor const& mat_a, th::Tensor const& mat_b, std::opti
 
 th::Tensor cublas_scaled_mm(th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const& scale_a,
     th::Tensor const& scale_b, std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype,
-    bool to_userbuffers = false);
+    int64_t output_buffer_kind = 0, c10::optional<torch::List<int64_t>> group = c10::nullopt);
 
 th::Tensor cublas_scaled_mm_out(th::Tensor const& mat_a, th::Tensor const& mat_b, th::Tensor const& scale_a,
     th::Tensor const& scale_b, std::optional<at::Tensor> const& bias, th::Tensor& out);
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

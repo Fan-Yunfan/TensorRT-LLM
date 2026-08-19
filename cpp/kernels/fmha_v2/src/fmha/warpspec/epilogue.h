@@ -1,16 +1,23 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
+
+#include "fmha/hopper/arrive_wait.h"
 
 #include <fmha/softmax.h>
 #include <fmha/traits.h>
@@ -69,6 +76,12 @@ struct Softmax_base
         SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+    };
+
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
     enum
     {
@@ -99,6 +112,12 @@ struct Softmax_base
         CHECK_IF_NEG_INF_EXISTS = SLIDING_OR_CHUNKED_ATTENTION || USE_CUSTOM_MASK
     };
 
+    // There are 2 warpgroups so 0x3 and 0x4 are used
+    enum
+    {
+        SKIP_SOFTMAX_BARRIER = Kernel_traits::SKIP_SOFTMAX_BARRIER_ID
+    };
+
     // Ctor.
     template <typename Params>
     inline __device__ Softmax_base(Params params, int tidx)
@@ -109,6 +128,11 @@ struct Softmax_base
         , log2_chunked_attention_size_(params.log2_chunked_attention_size)
         , packed_mask_ptr_{reinterpret_cast<uint32_t*>(params.packed_mask_ptr)}
         , params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes}
+#ifdef SKIP_SOFTMAX_STAT
+        , total_blocks(0)
+        , skipped_blocks(0)
+#endif
+        , skip_softmax_threshold(0)
     {
 
         int warp = tidx / 32;
@@ -116,7 +140,7 @@ struct Softmax_base
         // The corresponding row/col for each thread after MMA.
         // fixed 4x1 warp layout.
         quad_col_ = lane % 4;
-        if (CAUSAL_MASK)
+        if (CAUSAL_MASK || SLIDING_OR_CHUNKED_ATTENTION)
         {
             quad_row_ = warp * 16 + lane / 4;
         }
@@ -131,9 +155,14 @@ struct Softmax_base
             // The attention chunk start.
             return (row >> log2_chunked_attention_size_) << log2_chunked_attention_size_;
         }
+        else if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+        {
+            // The bidirectional sliding window start is the max of 0 and row - sliding_window_size/2.
+            return max(0, row - sliding_window_size_ / 2);
+        }
         else
         {
-            // The sliding window start is the max of 0 and row - sliding_window_size.
+            // The sliding window start is the max of 0 and row + 1 - sliding_window_size.
             return max(0, row + 1 - sliding_window_size_);
         }
     }
@@ -268,14 +297,18 @@ struct Softmax_base
                         valid_positions(mi, ni, v0, v1);
                         // Causal mask.
                     }
-                    else if constexpr (CAUSAL_MASK)
+                    else if constexpr (CAUSAL_MASK || SLIDING_OR_CHUNKED_ATTENTION)
                     {
                         // Causal Mask: we have to apply mask before getting max.
                         int row = row_offset + quad_row_ + mi * 8;
                         col = col_offset + quad_col_ * 2 + ni * 8;
-                        // Mask for the two N elements.
-                        v0 = (col <= row);
-                        v1 = (col + 1 <= row);
+
+                        if constexpr (CAUSAL_MASK)
+                        {
+                            // Mask for the two N elements.
+                            v0 &= (col <= row);
+                            v1 &= (col + 1 <= row);
+                        }
 
                         // Attend to the specific sliding window or chunk.
                         if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
@@ -283,6 +316,15 @@ struct Softmax_base
                             int sliding_window_or_chunk_start = compute_sliding_window_or_chunk_start(row);
                             v0 &= (col >= sliding_window_or_chunk_start);
                             v1 &= (col + 1 >= sliding_window_or_chunk_start);
+
+                            if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+                            {
+                                assert(log2_chunked_attention_size_ == 0
+                                    && "Bidirectional sliding window attention should not use chunked attention");
+                                int sliding_window_end = min(actual_seqlen - 1, row + sliding_window_size_ / 2);
+                                v0 &= (col <= sliding_window_end);
+                                v1 &= (col + 1 <= sliding_window_end);
+                            }
                         }
                         // Dense(padding) mask.
                     }
@@ -325,24 +367,22 @@ struct Softmax_base
     }
 
     // Calculate max/sum, and update flash-attention scales.
+    // Returns false if skipped due to skip-softmax attention feature.
     template <bool IS_FIRST_COL>
-    inline __device__ void compute_and_update_scale(
-        float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M])
+    inline __device__ bool compute_and_update_scale(
+        float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M], uint32_t* skip_softmax_vote)
     {
         float const scale = reinterpret_cast<float const&>(scale_bmm1_);
+
+        // whether this warpgroup skips the softmax
+        constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
+        bool skip = may_skip;
 
 // Row-wise max of current tile.
 #pragma unroll
         for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
         {
-            if (IS_FIRST_COL)
-            {
-                local_max_[mi] = elt_[mi][0];
-            }
-            else
-            {
-                local_max_[mi] = fmaxf(global_max[mi], elt_[mi][0]);
-            }
+            local_max_[mi] = elt_[mi][0];
 #pragma unroll
             for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++)
             {
@@ -350,6 +390,56 @@ struct Softmax_base
             }
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
+
+            if constexpr (may_skip)
+            {
+                // AND(&) the CORES_M results, then `skip` means whether to skip
+                // the CORES_M(=2) rows
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
+                    skip &= expf(local_max_[mi] - global_max[mi]) < skip_softmax_threshold;
+                }
+                else
+                {
+                    skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < skip_softmax_threshold;
+                }
+            }
+
+            if (!IS_FIRST_COL)
+            {
+                local_max_[mi] = fmaxf(local_max_[mi], global_max[mi]);
+            }
+        }
+
+        if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+        {
+#ifdef SKIP_SOFTMAX_STAT
+            total_blocks++;
+#endif
+            if constexpr (may_skip)
+            {
+
+                // AND(&) the results together in a warp, then `skip` means whether to skip
+                // all the 16 rows managed by this warp.
+                // each 4 threads (e.g. T0~T3) have the same `skip`, only 0x11111111 is needed
+                // instead of 0xffffffff. But the perf is the same.
+                skip = __all_sync(0xffffffff, skip);
+                if (threadIdx.x % 32 == 0)
+                {
+                    // The leader of each warp votes.
+                    atomicAnd(skip_softmax_vote, uint32_t(skip));
+                }
+                // WG0 uses 0x3 barrier, WG1 uses 0x4 barrier
+                named_barrier_wait(SKIP_SOFTMAX_BARRIER + threadIdx.x / 128, 128);
+                skip = *((uint32_t volatile*) skip_softmax_vote);
+                if (skip)
+                {
+#ifdef SKIP_SOFTMAX_STAT
+                    skipped_blocks++;
+#endif
+                    return false;
+                }
+            }
         }
 
 // Softmax Exp.
@@ -431,6 +521,7 @@ struct Softmax_base
                 global_max[mi] = max_new;
             }
         }
+        return true;
     }
 
     // Update flash attention scales and pack elements for BMM2.
@@ -508,6 +599,13 @@ struct Softmax_base
     float correction_[Mma_tile_p::CORES_M];
     // The packed mask.
     uint4 packed_mask_;
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold.
+    float skip_softmax_threshold;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax
+    uint32_t total_blocks;
+    uint32_t skipped_blocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -863,9 +961,10 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     }
 
     // Calculate max/sum, and update flash-attention scales.
+    // Returns false if skipped due to skip-softmax attention feature.
     template <bool IS_FIRST_COL>
-    inline __device__ void compute_and_update_scale(
-        float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M])
+    inline __device__ bool compute_and_update_scale(
+        float (&global_max)[Mma_tile_p::CORES_M], float (&global_sum)[Mma_tile_p::CORES_M], uint32_t* skip_softmax_vote)
     {
         float const scale = reinterpret_cast<float const&>(this->scale_bmm1_);
         float(&local_max_)[Mma_tile_p::CORES_M] = this->local_max_;
@@ -873,18 +972,15 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         float(&correction_)[Mma_tile_p::CORES_M] = this->correction_;
         float(&elt_)[Mma_tile_p::CORES_M][Mma_tile_p::CORES_N * 2] = this->elt_;
 
+        // whether this warpgroup skips the softmax
+        constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
+        bool skip = may_skip;
+
 // Row-wise max of current tile.
 #pragma unroll
         for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++)
         {
-            if (IS_FIRST_COL)
-            {
-                local_max_[mi] = elt_[mi][0];
-            }
-            else
-            {
-                local_max_[mi] = fmaxf(global_max[mi], elt_[mi][0]);
-            }
+            local_max_[mi] = elt_[mi][0];
 #pragma unroll
             for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++)
             {
@@ -892,6 +988,56 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
             }
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
             local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
+            // AND(&) the CORES_M results, then `skip` means whether to skip
+            // the CORES_M(=2) rows
+            if constexpr (may_skip)
+            {
+                // AND(&) the CORES_M results, then `skip` means whether to skip
+                // the CORES_M(=2) rows
+                if constexpr (!EXP2F_OPTIMIZATION)
+                {
+                    skip &= expf(local_max_[mi] - global_max[mi]) < this->skip_softmax_threshold;
+                }
+                else
+                {
+                    skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < this->skip_softmax_threshold;
+                }
+            }
+            if (!IS_FIRST_COL)
+            {
+                local_max_[mi] = fmaxf(local_max_[mi], global_max[mi]);
+            }
+        }
+
+        if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+        {
+#ifdef SKIP_SOFTMAX_STAT
+            this->total_blocks++;
+#endif
+
+            if constexpr (may_skip)
+            {
+                // AND(&) the results together in a warp, then `skip` means whether to skip
+                // all the 16 rows managed by this warp.
+                // each 4 threads (e.g. T0~T3) have the same `skip`, only 0x11111111 is needed
+                // instead of 0xffffffff. But the perf is the same.
+                skip = __all_sync(0xffffffff, skip);
+                if (threadIdx.x % 32 == 0)
+                {
+                    // The leader of each warp votes.
+                    atomicAnd(skip_softmax_vote, uint32_t(skip));
+                }
+                // WG0 uses 0x3 barrier, WG1 uses 0x4 barrier
+                named_barrier_wait(Base::SKIP_SOFTMAX_BARRIER + threadIdx.x / 128, 128);
+                skip = *((uint32_t volatile*) skip_softmax_vote);
+                if (skip)
+                {
+#ifdef SKIP_SOFTMAX_STAT
+                    this->skipped_blocks++;
+#endif
+                    return false;
+                }
+            }
         }
 
 // Softmax Exp.
@@ -982,6 +1128,7 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
                 global_max[mi] = max_new;
             }
         }
+        return true;
     }
 
     // Update flash attention scales and pack elements for BMM2.

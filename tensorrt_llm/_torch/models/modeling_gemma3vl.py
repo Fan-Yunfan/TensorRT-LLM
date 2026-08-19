@@ -1,17 +1,18 @@
 import copy
 import dataclasses
-import os
-from typing import List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 import torch
-from transformers import AutoProcessor, Gemma3Config, PreTrainedModel
+from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
+                          PretrainedConfig, PreTrainedModel)
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 
 from ..._utils import nvtx_range
-from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata,
+from ...inputs import (BaseMultimodalDummyInputsBuilder,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -21,27 +22,54 @@ from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_gemma3 import Gemma3ForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import (_MULTIMODAL_ENV_NAME, _is_mm_disagg,
+                                        fuse_input_embeds)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
-_MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
+class Gemma3InputProcessor(BaseMultimodalInputProcessor,
+                           BaseMultimodalDummyInputsBuilder):
 
-# Make this a runtime lookup rather than a module-wide constant for easier unit testing.
-def _is_disagg() -> bool:
-    return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+    def __init__(self,
+                 model_path: str,
+                 config: PretrainedConfig,
+                 tokenizer: AutoTokenizer,
+                 trust_remote_code: bool = True,
+                 **kwargs):
+        super().__init__(model_path=model_path,
+                         config=config,
+                         tokenizer=tokenizer,
+                         trust_remote_code=trust_remote_code,
+                         **kwargs)
+        self._config = config
+        self._tokenizer = tokenizer
+        self._model_path = model_path
+        self._processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=self.use_fast)
+        self._dtype = self.config.torch_dtype
 
+    @property
+    def config(self) -> PretrainedConfig:
+        return self._config
 
-class Gemma3InputProcessor(InputProcessor):
+    @property
+    def tokenizer(self) -> AutoTokenizer:
+        return self._tokenizer
 
-    def __init__(self, model_path, model_config, tokenizer, trust_remote_code):
+    @property
+    def model_path(self) -> str:
+        return self._model_path
 
-        self.tokenizer = tokenizer
-        self.processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code, use_fast=True)
-        self.model_config = model_config
-        self.device = 'cuda'
+    @property
+    def processor(self) -> AutoProcessor:
+        return self._processor
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
 
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
@@ -59,7 +87,7 @@ class Gemma3InputProcessor(InputProcessor):
             images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
-            device=self.device).to(dtype=torch.bfloat16)
+        ).to(dtype=self.dtype)
 
         input_ids = processor_output["input_ids"]
         pixel_values = processor_output.get("pixel_values")
@@ -67,7 +95,7 @@ class Gemma3InputProcessor(InputProcessor):
         return input_ids, pixel_values
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         input_ids, pixel_values = self._preprocess(inputs)
@@ -145,11 +173,28 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={"image": "<start_of_image>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Gemma3VLM(PreTrainedModel):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 — same VSWA rationale as
+        Gemma3ForCausalLM (the wrapped text model)."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
+
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise NotImplementedError(
                 "Gemma3VLM does not support disaggregated inference yet. Please unset "
                 f"the {_MULTIMODAL_ENV_NAME} environment variable, or set it to '0'."
@@ -164,6 +209,8 @@ class Gemma3VLM(PreTrainedModel):
         self.image_token_ids = torch.tensor([config.image_token_index],
                                             dtype=torch.int32,
                                             device=self._device)
+        self._mm_token_ids = torch.tensor([config.image_token_index],
+                                          dtype=torch.int32)
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
@@ -225,6 +272,10 @@ class Gemma3VLM(PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
@@ -264,7 +315,8 @@ class Gemma3VLM(PreTrainedModel):
             input_ids=input_ids,
             mm_embeds=mm_embeds,
             mm_token_ids=self.image_token_ids,
-            **kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
@@ -289,4 +341,4 @@ class Gemma3VLM(PreTrainedModel):
 
     @property
     def mm_token_ids(self):
-        return self.image_token_ids
+        return self._mm_token_ids

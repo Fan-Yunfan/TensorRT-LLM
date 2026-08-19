@@ -5,10 +5,26 @@ set -e
 set -u
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
+# Container runtimes (pyxis/enroot) reset image-defined variables like PATH
+# at container start, so values passed via srun --export are lost for them.
+# Allow the launcher config to prepend entries from inside the container.
+# The client_cmds srun passes these via --export with single-quoted values
+# (submit.py convert_envs_to_str), and srun keeps the quotes literal — strip them.
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND:-}"
+TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND#\'}"; TRTLLM_PATH_PREPEND="${TRTLLM_PATH_PREPEND%\'}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND:-}"
+TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND#\'}"; TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND%\'}"
+if [ -n "${TRTLLM_PATH_PREPEND:-}" ]; then
+    export PATH="${TRTLLM_PATH_PREPEND}:${PATH}"
+fi
+if [ -n "${TRTLLM_PYTHONPATH_PREPEND:-}" ]; then
+    export PYTHONPATH="${TRTLLM_PYTHONPATH_PREPEND}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
 # Add parameter validation
-if [ "$#" -lt 7 ]; then
-    echo "Error: Missing required arguments"
-    echo "Usage: $0 model_name dataset_file multi_round concurrency_list streaming log_path"
+if [ "$#" -lt 10 ]; then
+    echo "Error: Missing required arguments, got $# arguments, args: $@"
+    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests"
     exit 1
 fi
 
@@ -19,6 +35,9 @@ num_gen_servers=$4
 concurrency_list=$5
 streaming=$6
 log_path=$7
+hostname=$8
+port=$9
+ucx_warmup_requests=${10}
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -26,84 +45,117 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-config_file=${log_path}/server_config.yaml
-
-# check if the config file exists every 10 seconds timeout 1800 seconds
-timeout=1800
-start_time=$(date +%s)
-while [ ! -f ${config_file} ]; do
-    current_time=$(date +%s)
-    elapsed=$((current_time - start_time))
-    if [ $elapsed -ge $timeout ]; then
-        echo "Error: Config file ${config_file} not found within ${timeout} seconds"
-        exit 1
-    fi
-    if [ $((elapsed % 30)) -eq 0 ]; then
-        echo "Waiting for config file... (${elapsed}s elapsed)"
-    fi
-    sleep 10
-done
-
-# grep the host and port from the config file
-hostname=$(grep -i "hostname:" ${config_file} | awk '{print $2}')
-port=$(grep -i "port:" ${config_file} | awk '{print $2}')
-if [ -z "$hostname" ] || [ -z "$port" ]; then
-    echo "Error: Failed to extract hostname or port from config file"
-    exit 1
-fi
-echo "Hostname: ${hostname}, Port: ${port}"
-
-# check server is health by curl every 10 seconds timeout 1800 seconds
-timeout=1800
-start_time=$(date +%s)
-while ! curl -s -o /dev/null -w "%{http_code}" http://${hostname}:${port}/health; do
-    current_time=$(date +%s)
-    elapsed=$((current_time - start_time))
-    if [ $elapsed -ge $timeout ]; then
-        echo "Error: Server is not healthy after ${timeout} seconds"
-        exit 1
-    fi
-    if [ $((elapsed % 30)) -eq 0 ]; then
-        echo "Waiting for server to be healthy... (${elapsed}s elapsed)"
-    fi
-    sleep 10
-done
-
-# try client
-
 do_get_logs(){
-    worker_log_path=$1
-    output_folder=$2
-
-    # Check if log file exists
-    if [ ! -f "${worker_log_path}" ]; then
-        echo "Warning: Worker log file ${worker_log_path} not found"
-        touch "${output_folder}/gen_only.txt"
-        touch "${output_folder}/ctx_only.txt"
-        return 0
+    local input_file=$1
+    local output_file=$2
+    local mode=$3
+    local start_line=$4
+    # check mode is ctx or gen
+    if [ "${mode}" = "ctx" ]; then
+        sed -n "${start_line},\$p" ${input_file} | grep -a "'num_generation_tokens': 0" > ${output_file} || true
+    elif [ "${mode}" = "gen" ]; then
+        sed -n "${start_line},\$p" ${input_file} | grep -a "'num_ctx_requests': 0, 'num_ctx_tokens': 0" > ${output_file} || true
+    else
+        echo "Invalid mode: ${mode}"
+        return 1
     fi
+    return 0
+}
 
-    # Create output folder if it doesn't exist
-    mkdir -p "${output_folder}"
-
-    # Extract metrics with better error handling
-    if ! grep -a "'num_ctx_requests': 0, 'num_ctx_tokens': 0" "${worker_log_path}" > "${output_folder}/gen_only.txt" 2>/dev/null; then
-        echo "Note: No generation-only metrics found in ${worker_log_path}"
-        touch "${output_folder}/gen_only.txt"
+do_process_all_logs(){
+    local input_folder=$1
+    local output_folder=$2
+    local mode=$3
+    if [ "${mode}" != "line" ] && [ "${mode}" != "log" ] && [ "${mode}" != "clean" ]; then
+        echo "Invalid mode: ${mode}"
+        exit 1
     fi
-
-    if ! grep -a "'num_generation_tokens': 0" "${worker_log_path}" > "${output_folder}/ctx_only.txt" 2>/dev/null; then
-        echo "Note: No context-only metrics found in ${worker_log_path}"
-        touch "${output_folder}/ctx_only.txt"
+    local ctx_log
+    local ctx_num
+    local gen_log
+    local gen_num
+    local line_count
+    local start_line
+    for ctx_log in ${input_folder}/3_output_CTX_*.log; do
+        if [ -f "${ctx_log}" ]; then
+            ctx_num=$(basename "${ctx_log}" | sed 's/3_output_CTX_\([0-9]*\)\.log/\1/')
+            if [ "${mode}" = "line" ]; then
+                line_count=$(wc -l < ${ctx_log})
+                echo ${line_count} > ${output_folder}/ctx_only_line_${ctx_num}.txt
+            elif [ "${mode}" = "log" ]; then
+                if [ ! -f "${output_folder}/ctx_only_line_${ctx_num}.txt" ]; then
+                    start_line=0
+                else
+                    start_line=$(cat ${output_folder}/ctx_only_line_${ctx_num}.txt)
+                    rm -f ${output_folder}/ctx_only_line_${ctx_num}.txt
+                fi
+                do_get_logs ${ctx_log} ${output_folder}/ctx_only_${ctx_num}.txt "ctx" ${start_line}
+            elif [ "${mode}" = "clean" ]; then
+                rm -f ${ctx_log}
+            fi
+        fi
+    done
+    # process all the gen log files in the input folder
+    for gen_log in ${input_folder}/3_output_GEN_*.log; do
+        if [ -f "${gen_log}" ]; then
+            gen_num=$(basename "${gen_log}" | sed 's/3_output_GEN_\([0-9]*\)\.log/\1/')
+            if [ "${mode}" = "line" ]; then
+                line_count=$(wc -l < ${gen_log})
+                echo ${line_count} > ${output_folder}/gen_only_line_${gen_num}.txt
+            elif [ "${mode}" = "log" ]; then
+                if [ ! -f "${output_folder}/gen_only_line_${gen_num}.txt" ]; then
+                    start_line=0
+                else
+                    start_line=$(cat ${output_folder}/gen_only_line_${gen_num}.txt)
+                    rm -f ${output_folder}/gen_only_line_${gen_num}.txt
+                fi
+                do_get_logs ${gen_log} ${output_folder}/gen_only_${gen_num}.txt "gen" ${start_line}
+            elif [ "${mode}" = "clean" ]; then
+                rm -f ${gen_log}
+            fi
+        fi
+    done
+    if [ "${mode}" = "clean" ]; then
+        if [ -d "${tmp_start_logs}" ]; then
+            mkdir -p ${log_path}/start_logs
+            cp ${tmp_start_logs}/3_output_CTX_*.log ${log_path}/start_logs/ 2>/dev/null || true
+            cp ${tmp_start_logs}/3_output_GEN_*.log ${log_path}/start_logs/ 2>/dev/null || true
+            rm -rf ${tmp_start_logs}
+        fi
     fi
 }
 
+tmp_start_logs=/tmp/${SLURM_JOB_ID}/start_logs
+mkdir -p ${tmp_start_logs}
+cp ${log_path}/3_output_CTX_*.log ${tmp_start_logs}/ 2>/dev/null || true
+cp ${log_path}/3_output_GEN_*.log ${tmp_start_logs}/ 2>/dev/null || true
+
+# warmup requests for ucx connections
+if [ "${ucx_warmup_requests}" -gt 0 ]; then
+    echo "warming up ucx connections with small requests... ${ucx_warmup_requests}"
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --dataset-name random \
+        --random-ids \
+        --random-input-len 100 \
+        --random-output-len 10 \
+        --num-prompts ${ucx_warmup_requests} \
+        --host ${hostname} \
+        --port ${port} \
+        --ignore-eos \
+        --non-streaming \
+        --trust-remote-code
+    echo "UCX warmup done"
+fi
+
+echo "Hostname: ${hostname}, Port: ${port}"
 echo "Starting benchmark..."
 for concurrency in ${concurrency_list}; do
     concurrency=$((concurrency * num_gen_servers))
     num_prompts=$((concurrency * multi_round))
     echo "Benchmarking with concurrency ${concurrency} ... ${num_prompts} prompts"
     mkdir -p ${log_path}/concurrency_${concurrency}
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "line"
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --model ${model_name} \
         --backend openai \
@@ -113,6 +165,7 @@ for concurrency in ${concurrency_list}; do
         --dataset-path ${dataset_file} \
         --num-prompts ${num_prompts} \
         --max-concurrency ${concurrency} \
+        --trust-remote-code \
         --ignore-eos \
         --no-test-input \
         --save-result \
@@ -121,22 +174,6 @@ for concurrency in ${concurrency_list}; do
         --percentile-metrics "ttft,tpot,itl,e2el" \
         $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
     echo "Benchmark with concurrency ${concurrency} done"
+    do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
 done
-
-job_id=${SLURM_JOB_ID}
-if [ -n "${job_id}" ]; then
-    echo "${SLURM_JOB_NODELIST}" > ${log_path}/job_${job_id}.txt
-fi
-
-echo "Benchmark done, gracefully shutting down server and workers..."
-kill -9 $(ps aux | grep '[s]tart_server.sh' | awk '{print $2}') >/dev/null 2>&1 || true
-kill -9 $(ps aux | grep '[s]tart_worker.sh' | awk '{print $2}') >/dev/null 2>&1 || true
-kill -9 $(ps aux | grep '[t]rtllm-serve' | awk '{print $2}') >/dev/null 2>&1 || true
-sleep 20  # Give processes some time to clean up
-
-# Check if there are any remaining processes
-if pgrep -f "trtllm-serve"; then
-    echo "Warning: Some processes may still be running"
-else
-    echo "All processes successfully terminated"
-fi
+# do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "clean"

@@ -5,8 +5,9 @@ from typing import Optional
 
 import click
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (EagleDecodingConfig, KvCacheConfig,
+from tensorrt_llm import LLM, SamplingParams, logger
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.llmapi import (Eagle3DecodingConfig, KvCacheConfig,
                                  MTPDecodingConfig, NGramDecodingConfig)
 
 prompts = [
@@ -16,8 +17,15 @@ prompts = [
 
 
 def run_MTP(model: Optional[str] = None):
-    spec_config = MTPDecodingConfig(num_nextn_predict_layers=1,
-                                    use_relaxed_acceptance_for_thinking=True,
+    sm_version = get_sm_version()
+    if sm_version < 90:
+        logger.warning(
+            f"Skipping the MTP example: it requires the DeepSeek MLA "
+            "generation FMHA kernel, which is only available on "
+            f"Hopper+ (SM>=90). Detected SM{sm_version}.")
+        return
+
+    spec_config = MTPDecodingConfig(use_relaxed_acceptance_for_thinking=True,
                                     relaxed_topk=10,
                                     relaxed_delta=0.01)
 
@@ -33,9 +41,9 @@ def run_MTP(model: Optional[str] = None):
 
 
 def run_Eagle3():
-    spec_config = EagleDecodingConfig(
+    spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
-        speculative_model_dir="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+        speculative_model="yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
         eagle3_one_model=True)
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)

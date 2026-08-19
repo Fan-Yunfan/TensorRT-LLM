@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,11 +15,15 @@
 # -*- coding: utf-8 -*-
 
 import datetime
+import gc
+import importlib
+import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import time
 import urllib.request
@@ -35,6 +39,14 @@ import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
+# Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
+# non-top-level conftest: a repo-root invocation like `pytest tests` loads
+# this file as a NESTED conftest and would fail collection; and not via "-p"
+# in pytest.ini addopts, which imports at preparse, before the ini pythonpath
+# entries are usable). The wrappers below forward to the plugin; hooks are
+# idempotent, so a repo-root run that also dispatches from tests/conftest.py
+# is harmless.
+from test_common import session_prefetcher_hooks as _prefetch_hooks
 
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
@@ -47,16 +59,26 @@ from .test_list_parser import (TestCorrectionMode, apply_waives,
 from .trt_test_alternative import (call, check_output, exists, is_windows,
                                    is_wsl, makedirs, print_info, print_warning,
                                    wsl_to_win_path)
+from .utils.periodic_junit import PeriodicJUnitXML
 
 try:
     from llm import trt_environment
 except ImportError:
     trt_environment = None
 
+# Logger
+logger = logging.getLogger(__name__)
+
 # TODO: turn off this when the nightly storage issue is resolved.
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
-GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
-GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
+
+
+def _get_s3_output():
+    tests_root = Path(__file__).resolve().parents[2]
+    tests_root_str = str(tests_root)
+    if tests_root_str not in sys.path:
+        sys.path.append(tests_root_str)
+    return importlib.import_module("test_common.s3_output")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -77,7 +99,7 @@ def wget(url, out):
 def llm_models_root() -> str:
     """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
 
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ.get("LLM_MODELS_ROOT"))
 
@@ -216,15 +238,6 @@ def bert_example_root(llm_root):
 
 
 @pytest.fixture(scope="module")
-def enc_dec_example_root(llm_root):
-    "Get encoder-decoder example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "enc_dec")
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def whisper_example_root(llm_root, llm_venv):
     "Get whisper example root"
     example_root = os.path.join(llm_root, "examples", "models", "core",
@@ -233,39 +246,6 @@ def whisper_example_root(llm_root, llm_venv):
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
     ])
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def opt_example_root(llm_root, llm_venv):
-    "Get opt example root"
-
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "opt")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def llama_example_root(llm_root, llm_venv):
-    "Get llama example root"
-
-    example_root = os.path.join(llm_root, "examples", "models", "core", "llama")
-    try:
-        llm_venv.run_cmd([
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            os.path.join(example_root, "requirements.txt"),
-        ])
-    except:
-        print("pip install error!")
-
     return example_root
 
 
@@ -285,33 +265,6 @@ def disaggregated_example_root(llm_root, llm_venv):
     example_root = os.path.join(llm_root, "examples", "disaggregated")
 
     return example_root
-
-
-@pytest.fixture(scope="module")
-def gemma_example_root(llm_root, llm_venv):
-    "Get gemma example root"
-
-    example_root = os.path.join(llm_root, "examples", "models", "core", "gemma")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="function")
-def gemma_model_root(request):
-    "Get gemma model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if hasattr(request, "param"):
-        gemma_model_root = os.path.join(models_root, f"gemma/{request.param}")
-
-    assert exists(gemma_model_root), f"{gemma_model_root} does not exist!"
-
-    return gemma_model_root
 
 
 @pytest.fixture(scope="function")
@@ -370,41 +323,6 @@ def gpt_example_root(llm_root, llm_venv):
     return example_root
 
 
-@pytest.fixture(scope="module")
-def gptj_example_root(llm_root, llm_venv):
-    "Get gptj example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "gptj")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def glm_4_9b_example_root(llm_root, llm_venv):
-    "Get glm-4-9b example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "glm-4-9b")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def exaone_example_root(llm_root, llm_venv):
-    "Get EXAONE example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "exaone")
-
-    return example_root
-
-
 @pytest.fixture(scope="function")
 def llm_exaone_model_root(request) -> str:
     "Get EXAONE model root"
@@ -422,26 +340,6 @@ def llm_exaone_model_root(request) -> str:
 
 
 @pytest.fixture(scope="module")
-def falcon_example_root(llm_root, llm_venv):
-    "Get falcon example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "falcon")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="session")
-def plugin_gen_path(llm_root):
-    "Path to the plugin_gen.py script"
-    return os.path.join(llm_root, "tensorrt_llm", "tools", "plugin_gen",
-                        "plugin_gen.py")
-
-
-@pytest.fixture(scope="module")
 def internlm2_example_root(llm_root, llm_venv):
     "Get internlm2 example root"
     example_root = os.path.join(llm_root, "examples", "models", "core",
@@ -455,152 +353,9 @@ def internlm2_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def qwen_example_root(llm_root, llm_venv):
-    "Get qwen example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core", "qwen")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def draft_target_model_example_root(llm_root, llm_venv):
-    "Get Draft-Target-Model example root"
-    example_root = os.path.join(llm_root, "examples", "draft_target_model")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def ngram_example_root(llm_root, llm_venv):
-    "Get NGram example root"
-    example_root = os.path.join(llm_root, "examples", "ngram")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
 def medusa_example_root(llm_root, llm_venv):
     "Get medusa example root"
     example_root = os.path.join(llm_root, "examples", "medusa")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def redrafter_example_root(llm_root, llm_venv):
-    "Get ReDrafter example root"
-    example_root = os.path.join(llm_root, "examples", "redrafter")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def eagle_example_root(llm_root, llm_venv):
-    "Get EAGLE example root"
-    example_root = os.path.join(llm_root, "examples", "eagle")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def mamba_example_root(llm_root, llm_venv):
-    "Get mamba example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core", "mamba")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    yield example_root
-
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(llm_root, "requirements.txt")
-    ])
-
-
-@pytest.fixture(scope="module")
-def recurrentgemma_example_root(llm_root, llm_venv):
-    "Get recurrentgemma example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "recurrentgemma")
-
-    # install requirements
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    yield example_root
-
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(llm_root, "requirements.txt")
-    ])
-
-
-@pytest.fixture(scope="module")
-def nemotron_nas_example_root(llm_root, llm_venv):
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "nemotron_nas")
-
-    yield example_root
-
-
-@pytest.fixture(scope="module")
-def nemotron_example_root(llm_root, llm_venv):
-    "Get nemotron example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "nemotron")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def commandr_example_root(llm_root, llm_venv):
-    "Get commandr example root"
-    example_root = os.path.join(llm_root, "examples", "models", "core",
-                                "commandr")
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
-    return example_root
-
-
-@pytest.fixture(scope="module")
-def deepseek_v2_example_root(llm_root, llm_venv):
-    "Get deepseek v2 example root"
-    example_root = os.path.join(llm_root, "examples", "models", "contrib",
-                                "deepseek_v2")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -626,6 +381,15 @@ def deepseek_v3_model_root(request):
     assert exists(
         deepseek_v3_model_root), f"{deepseek_v3_model_root} does not exist!"
     return deepseek_v3_model_root
+
+
+@pytest.fixture(scope="function")
+def gpt_oss_model_root(request):
+    models_root = os.path.join(llm_models_root(), "gpt_oss")
+    if request.param == "gpt-oss-20b":
+        gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
+    assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"
+    return gpt_oss_model_root
 
 
 @pytest.fixture(scope="session")
@@ -664,9 +428,11 @@ def trt_gpu_clock_lock(request):
     gpu_list = get_gpu_device_list()
     gpu_ids = [gpu.split()[1][:-1] for gpu in gpu_list]  # Extract GPU IDs
     gpu_ids_str = ",".join(gpu_ids)
+    enable_clock_locking = request.config.getoption("--enable-gpu-clock-lock")
     gpu_clock_lock = GPUClockLock(
         gpu_id=gpu_ids_str,
         interval_ms=1000.0,
+        enable_clock_locking=enable_clock_locking,
     )
 
     yield gpu_clock_lock
@@ -696,12 +462,13 @@ def custom_user_workspace(request):
 
 
 @pytest.fixture(scope="session")
-def llm_venv(llm_root, custom_user_workspace):
+def llm_venv(request, llm_root, custom_user_workspace):
     workspace_dir = custom_user_workspace
     subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
     if workspace_dir is None:
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
+    keep_workspace = request.config.getoption("--keep-workspace", default=False)
     from defs.local_venv import PythonVenvRunnerImpl
 
     venv = PythonVenvRunnerImpl("", "", "python3",
@@ -709,11 +476,11 @@ def llm_venv(llm_root, custom_user_workspace):
     yield venv
     # Remove the workspace directory
     if os.path.exists(workspace_dir):
-        print(f"Cleaning up workspace: {workspace_dir}")
-        try:
-            shutil.rmtree(workspace_dir)
-        except Exception as e:
-            print(f"Failed to clean up workspace: {e}")
+        if keep_workspace:
+            print(f"Keeping workspace (--keep-workspace): {workspace_dir}")
+        else:
+            print(f"Cleaning up workspace: {workspace_dir}")
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -747,7 +514,7 @@ def enc_dec_model_root(request):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if not "wmt" in tllm_model_name:
+    if "wmt" not in tllm_model_name:
         # HuggingFace root
         enc_dec_model_root = os.path.join(models_root, tllm_model_name)
     else:
@@ -793,8 +560,6 @@ def multimodal_model_root(request, llm_venv):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if "VILA" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "vila")
     if "cogvlm-chat" in tllm_model_name:
         models_root = os.path.join(llm_models_root(), "cogvlm-chat")
     if "video-neva" in tllm_model_name:
@@ -812,8 +577,6 @@ def multimodal_model_root(request, llm_venv):
 
     if "llava-onevision" in tllm_model_name and "video" in tllm_model_name:
         multimodal_model_root = multimodal_model_root[:-6]
-    elif "llava-v1.6" in tllm_model_name and "vision-trtllm" in tllm_model_name:
-        multimodal_model_root = multimodal_model_root[:-14]
 
     assert os.path.exists(
         multimodal_model_root
@@ -882,13 +645,6 @@ def llm_gpt2_starcoder_model_root(llm_venv, request):
     return starcoder_model_root
 
 
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("starcoder2-3b", True)
-def llm_gpt2_starcoder2_model_root():
-    "get starcoder2-3b"
-    raise RuntimeError("starcoder2-3b must be cached")
-
-
 @pytest.fixture(scope="function")
 def starcoder_model_root(request):
     models_root = llm_models_root()
@@ -897,8 +653,6 @@ def starcoder_model_root(request):
         starcoder_model_root = os.path.join(models_root, "starcoder-model")
     elif request.param == "starcoder2-15b":
         starcoder_model_root = os.path.join(models_root, "starcoder2-model")
-    elif request.param == "starcoder2-3b":
-        starcoder_model_root = os.path.join(models_root, "starcoder2-3b")
     elif request.param == "starcoderplus":
         starcoder_model_root = os.path.join(models_root, "starcoderplus")
 
@@ -933,16 +687,6 @@ def llm_gpt2b_lora_model_root(request):
 
 
 @pytest.fixture(scope="module")
-def llama_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    # Use llama-7b-hf to load tokenizer
-    llama_tokenzier_model_root = os.path.join(models_root, "llama-models",
-                                              "llama-7b-hf")
-    return llama_tokenzier_model_root
-
-
-@pytest.fixture(scope="module")
 def llama_v2_tokenizer_model_root():
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -958,37 +702,12 @@ def llama_v2_tokenizer_model_root():
 def llama_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "llama-7b":
-        llama_model_root = os.path.join(models_root, "llama-models",
-                                        "llama-7b-hf")
-    elif request.param == "llama-30b":
+    if request.param == "llama-30b":
         llama_model_root = os.path.join(models_root, "llama-models",
                                         "llama-30b-hf")
     elif request.param == "TinyLlama-1.1B-Chat-v1.0":
         llama_model_root = os.path.join(models_root, "llama-models-v2",
                                         "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-v2-7b":
-        llama_model_root = os.path.join(models_root, "llama-models-v2", "7B")
-    elif request.param == "llama-v2-70b":
-        llama_model_root = os.path.join(models_root, "llama-models-v2", "70B")
-    elif request.param == "llama-v2-70b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-70b-hf")
-    elif request.param == "Llama-2-7B-AWQ":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "Llama-2-7B-AWQ")
-    elif request.param == "Llama-2-7B-GPTQ":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "Llama-2-7B-GPTQ")
-    elif request.param == "llama-v2-13b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-13b-hf")
-    elif request.param == "llama-v2-7b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-7b-hf")
-    elif request.param == "llama-v2-70b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "llama-v2-70b-hf")
     elif request.param == "llama-v3-8b-hf":
         llama_model_root = os.path.join(models_root, "llama-models-v3", "8B")
     elif request.param == "llama-v3-8b-instruct-hf":
@@ -1000,33 +719,33 @@ def llama_model_root(request):
     elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
         llama_model_root = os.path.join(models_root, "llama-models-v3",
                                         "Llama-3-70B-Instruct-Gradient-1048k")
-    elif request.param == "llama-3.1-405b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-405B")
-    elif request.param == "llama-3.1-405b-fp8":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-405B-FP8")
-    elif request.param == "llama-3.1-70b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-70B")
     elif request.param == "llama-3.1-8b":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Meta-Llama-3.1-8B")
     elif request.param == "llama-3.1-8b-instruct-hf-fp8":
         llama_model_root = os.path.join(models_root, "llama-3.1-model",
                                         "Llama-3.1-8B-Instruct-FP8")
+    elif request.param == "llama-3.1-8b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.1-model",
+                                        "Llama-3.1-8B-Instruct")
     elif request.param == "llama-3.1-8b-hf-nvfp4":
         llama_model_root = os.path.join(models_root, "nvfp4-quantized",
                                         "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.1-70b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-70B-Instruct")
     elif request.param == "llama-3.2-1b":
         llama_model_root = os.path.join(models_root, "llama-3.2-models",
                                         "Llama-3.2-1B")
+    elif request.param == "llama-3.2-1b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.2-models",
+                                        "Llama-3.2-1B-Instruct")
     elif request.param == "llama-3.2-3b":
         llama_model_root = os.path.join(models_root, "llama-3.2-models",
                                         "Llama-3.2-3B")
+    elif request.param == "llama-3.2-3b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.2-models",
+                                        "Llama-3.2-3B-Instruct")
+    elif request.param == "llama-3.3-70b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.3-models",
+                                        "Llama-3.3-70B-Instruct")
     assert os.path.exists(
         llama_model_root
     ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -1062,11 +781,6 @@ def draft_target_model_roots(request):
     if request.param == "gpt2":
         draft_model_root = os.path.join(models_root, "gpt2-medium")
         target_model_root = os.path.join(models_root, "gpt2-medium")
-    elif request.param == "llama_v2":
-        draft_model_root = os.path.join(models_root,
-                                        "llama-models-v2/llama-v2-7b-hf")
-        target_model_root = os.path.join(models_root,
-                                         "llama-models-v2/llama-v2-13b-hf")
 
     assert os.path.exists(
         draft_model_root
@@ -1083,9 +797,6 @@ def ngram_root(request):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
     if request.param == "gpt2":
         models_root = os.path.join(models_root, "gpt2-medium")
-    elif request.param == "llama_v2":
-        models_root = os.path.join(models_root,
-                                   "llama-models-v2/llama-v2-13b-hf")
     assert os.path.exists(
         models_root
     ), f"NGram model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
@@ -1230,33 +941,6 @@ def mamba_model_root(request):
 
 
 @pytest.fixture(scope="function")
-def recurrentgemma_model_root(request):
-    "get recurrentgemma model data"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-
-    if request.param == "recurrentgemma-2b":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b")
-    elif request.param == "recurrentgemma-2b-it":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b-it")
-    elif request.param == "recurrentgemma-2b-flax":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b-flax", "2b")
-    elif request.param == "recurrentgemma-2b-it-flax":
-        recurrentgemma_model_root = os.path.join(models_root, "recurrentgemma",
-                                                 "recurrentgemma-2b-it-flax",
-                                                 "2b-it")
-
-    assert exists(recurrentgemma_model_root
-                  ), f"{recurrentgemma_model_root} does not exist!"
-
-    return recurrentgemma_model_root
-
-
-@pytest.fixture(scope="function")
 def nemotron_nas_model_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -1285,11 +969,7 @@ def llm_lora_model_root(request):
         model_list = [request.param]
 
     for item in model_list:
-        if item == "chinese-llama-2-lora-13b":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models-v2",
-                             "chinese-llama-2-lora-13b"))
-        elif item == "Japanese-Alpaca-LoRA-7b-v0":
+        if item == "Japanese-Alpaca-LoRA-7b-v0":
             model_root_list.append(
                 os.path.join(models_root, "llama-models",
                              "Japanese-Alpaca-LoRA-7b-v0"))
@@ -1305,10 +985,6 @@ def llm_lora_model_root(request):
         elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
             model_root_list.append(
                 os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
-        elif item == "Phi-3-mini-4k-instruct-ru-lora":
-            model_root_list.append(
-                os.path.join(models_root, "lora", "phi",
-                             "Phi-3-mini-4k-instruct-ru-lora"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
@@ -1323,6 +999,15 @@ def llm_lora_model_root(request):
         elif item == "komt-mistral-7b-v1-lora":
             model_root_list.append(
                 os.path.join(models_root, "komt-mistral-7b-v1-lora"))
+        elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
+            model_root_list.append(
+                os.path.join(
+                    models_root, "nemotron-nas",
+                    "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
+        elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
+            model_root_list.append(
+                os.path.join(models_root, "gpt_oss",
+                             "gpt-oss-20b-lora-adapter_NIM_r8"))
 
     return ",".join(model_root_list)
 
@@ -1363,6 +1048,8 @@ def llm_mistral_model_root(request):
     model_root = os.path.join(models_root, "mistral-7b-v0.1")
     if request.param == "mistral-7b-v0.1":
         model_root = os.path.join(models_root, "mistral-7b-v0.1")
+    if request.param == "mistral-nemo-instruct-2407":
+        model_root = os.path.join(models_root, "Mistral-Nemo-Instruct-2407")
     if request.param == "komt-mistral-7b-v1":
         model_root = os.path.join(models_root, "komt-mistral-7b-v1")
     if request.param == "mistral-7b-v0.3":
@@ -1418,26 +1105,6 @@ def llm_gptneox_model_root(llm_venv):
     gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
 
     return gptneox_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_phi_model_root(request):
-    "return phi model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if "Phi-3.5" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3.5/" + request.param)
-    elif "Phi-3" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3/" + request.param)
-    else:
-        phi_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        phi_model_root
-    ), f"{phi_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return phi_model_root
 
 
 @pytest.fixture(scope="module")
@@ -1856,10 +1523,12 @@ def skip_by_mpi_world_size(request):
 @pytest.fixture(autouse=True)
 def skip_by_device_memory(request):
     "fixture for skip less device memory"
-    if request.node.get_closest_marker("skip_less_device_memory"):
+    # Get all markers, not just the closest one
+    markers = request.node.iter_markers("skip_less_device_memory")
+
+    for marker in markers:
         device_memory = get_device_memory()
-        expected_memory = request.node.get_closest_marker(
-            "skip_less_device_memory").args[0]
+        expected_memory = marker.args[0]
         if expected_memory > int(device_memory):
             pytest.skip(
                 f"Device memory {device_memory} is less than {expected_memory}")
@@ -1867,8 +1536,19 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    prop = torch.cuda.get_device_properties(0)
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        prop = torch.cuda.get_device_properties(0)
+    except RuntimeError:
+        return 0
     return prop.major * 10 + prop.minor
+
+
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version >= 100 and sm_version < 110
 
 
 def get_gpu_device_list():
@@ -1877,14 +1557,27 @@ def get_gpu_device_list():
         suffix = ".exe" if is_windows() else ""
         # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
         cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return []
     return [l.strip() for l in output.strip().split("\n")]
 
 
 def check_device_contain(keyword_list):
     "check device not contain keyword"
-    device = get_gpu_device_list()[0]
+    devices = get_gpu_device_list()
+    device = devices[0] if devices else ""
     return any(keyword in device for keyword in keyword_list)
+
+
+def is_ipc_nvls_supported():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return ipc_nvls_supported()
+    except RuntimeError:
+        return False
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1894,6 +1587,11 @@ skip_pre_ada = pytest.mark.skipif(
 skip_pre_hopper = pytest.mark.skipif(
     get_sm_version() < 90,
     reason="This test is not supported in pre-Hopper architecture",
+)
+
+skip_post_hopper = pytest.mark.skipif(
+    get_sm_version() > 90,
+    reason="This test is not supported in post-Hopper architecture",
 )
 
 skip_pre_blackwell = pytest.mark.skipif(
@@ -1906,9 +1604,19 @@ skip_post_blackwell = pytest.mark.skipif(
     reason="This test is not supported in post-Blackwell architecture",
 )
 
+skip_no_rubin = pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported in Rubin architecture",
+)
+
 skip_post_blackwell_ultra = pytest.mark.skipif(
     get_sm_version() >= 103,
     reason="This test is not supported in post-Blackwell-Ultra architecture",
+)
+
+skip_pre_rubin = pytest.mark.skipif(
+    get_sm_version() < 107,
+    reason="This test is not supported in pre-Rubin architecture",
 )
 
 skip_device_contain_gb200 = pytest.mark.skipif(
@@ -1916,11 +1624,15 @@ skip_device_contain_gb200 = pytest.mark.skipif(
     reason="This test is not supported on GB200 or GB100",
 )
 
-skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
+skip_no_nvls = pytest.mark.skipif(not is_ipc_nvls_supported(),
                                   reason="NVLS is not supported")
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")
+
+skip_no_mxfp4_swizzle = pytest.mark.skipif(
+    check_device_contain(["H20"]) and not check_device_contain(["H200"]),
+    reason="nvbugs/5446119: MXFP4 swizzle not supported on H20")
 
 skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
                                    reason="This test is for SM120")
@@ -1995,6 +1707,7 @@ def get_device_memory():
 
 
 def pytest_addoption(parser):
+    _get_s3_output().add_options(parser)
     parser.addoption(
         "--test-list",
         "-F",
@@ -2053,11 +1766,99 @@ def pytest_addoption(parser):
                      action="store_true",
                      help="'--perf' will run perf tests")
     parser.addoption(
+        "--run-ray",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Ray orchestrator path for integration tests (disables MPI).",
+    )
+    parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
+    )
+    parser.addoption(
         "--perf-log-formats",
         help=
         "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",
         action="append",
         default=[],
+    )
+    parser.addoption(
+        "--test-model-suites",
+        action="store",
+        default=None,
+        help=
+        "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
+        "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
+    )
+    parser.addoption(
+        "--periodic-junit",
+        action="store_true",
+        default=False,
+        help=
+        "Enable periodic JUnit XML reporter. This reporter leverages pytest's built-in junitxml "
+        "for reliable test result handling. Saves progress periodically to prevent data loss on "
+        "interruption. Requires --output-dir to be set.",
+    )
+    parser.addoption(
+        "--periodic-interval",
+        action="store",
+        type=int,
+        default=18000,
+        help=
+        "Time interval in seconds between periodic saves (default: 18000s = 5 hours). "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-batch-size",
+        action="store",
+        type=int,
+        default=10,
+        help=
+        "Number of completed tests before triggering a periodic save (default: 10). "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-junit-xmlpath",
+        action="store",
+        default=None,
+        help="Path to the output XML file for periodic JUnit XML reporter. "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--enable-gpu-clock-lock",
+        action="store_true",
+        default=False,
+        help="Enable GPU clock locking during tests. "
+        "By default, GPU clock locking is disabled.",
+    )
+    parser.addoption(
+        "--keep-workspace",
+        action="store_true",
+        default=False,
+        help=
+        "Skip workspace cleanup at session end (useful for inspecting logs after a failure).",
+    )
+    parser.addoption(
+        "--periodic-save-unfinished-test",
+        action="store_true",
+        default=False,
+        help=
+        "Save unfinished test name to unfinished_test.txt during test execution (default: False). "
+        "This helps identify which test was running when a timeout or crash occurs. "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt when a test overruns its "
+        "timeout or the process is signalled (default: False). This turns an empty "
+        "'Test terminated unexpectedly' record into a diagnosable hang stack. "
+        "Only used with --periodic-junit.",
     )
 
 
@@ -2105,6 +1906,7 @@ def pytest_collection_modifyitems(session, config, items):
     waives_file = config.getoption("--waives-file")
     test_prefix = config.getoption("--test-prefix")
     perf_test = config.getoption("--perf")
+    test_model_suites = config.getoption("--test-model-suites")
 
     if perf_test:
         global ALL_PYTEST_ITEMS
@@ -2135,8 +1937,20 @@ def pytest_collection_modifyitems(session, config, items):
     if regexp is not None:
         deselect_by_regex(regexp, items, test_prefix, config)
 
+    if test_model_suites:
+        deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                      config)
+
     if waives_file:
         apply_waives(waives_file, items, config)
+
+    # Skip tests with pytest.mark.ray unless --run-ray is passed.
+    if not config.getoption("--run-ray"):
+        skip_marker = pytest.mark.skip(
+            reason="Ray tests skipped; pass --run-ray to enable")
+        for item in items:
+            if item.get_closest_marker("ray") is not None:
+                item.add_marker(skip_marker)
 
     # We have to remove prefix temporarily before splitting the test list
     # After that change back the test id.
@@ -2150,8 +1964,119 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    _prefetch_hooks.pytest_configure(config)
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+    if config.getoption("--run-ray"):
+        os.environ["TLLM_DISABLE_MPI"] = "1"
+        os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
+
+    # xdist worker processes must not register PeriodicJUnitXML: all worker
+    # reports are forwarded to the controller via xdist and processed there,
+    # so registering on workers causes concurrent writers to the same
+    # unfinished_test.txt and races out cleanup entries.
+    if hasattr(config, "workerinput"):
+        return
+
+    # Initialize PeriodicJUnitXML reporter if enabled
+    periodic = config.getoption("--periodic-junit", default=False)
+    output_dir = config.getoption("--output-dir", default=None)
+    periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
+                                              default=None)
+    if periodic and output_dir:
+        periodic_interval = config.getoption("--periodic-interval")
+        periodic_batch_size = config.getoption("--periodic-batch-size")
+        periodic_save_unfinished_test = config.getoption(
+            "--periodic-save-unfinished-test", default=False)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
+
+        # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
+        # that may need to write to the same directory (e.g., pytest-split)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Create the reporter with logger
+        xmlpath = periodic_junit_xmlpath or os.path.join(
+            output_dir, "results.xml")
+        reporter = PeriodicJUnitXML(
+            xmlpath=xmlpath,
+            interval=periodic_interval,
+            batch_size=periodic_batch_size,
+            logger={
+                'info': print_info,
+                'warning': print_warning
+            },
+            save_unfinished_test=periodic_save_unfinished_test,
+            dump_hang_traceback=periodic_hang_traceback,
+        )
+
+        # Configure and register the reporter
+        reporter.pytest_configure(config)
+        config.pluginmanager.register(reporter, 'periodic_junit')
+
+        print_info("PeriodicJUnitXML reporter registered")
+        print_info(
+            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
+        )
+        print_info(f"  Batch size: {periodic_batch_size} tests")
+        print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
+        print_info(f"  Hang traceback: {periodic_hang_traceback}")
+    elif periodic and not output_dir:
+        print_warning(
+            "Warning: --periodic-junit requires --output-dir to be set. "
+            "Periodic reporting disabled.")
+
+
+def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                  config):
+    """Filter tests based on the test model suites specified.
+    If a test matches any of the test model suite names, it is considered selected.
+
+    Args:
+        test_model_suites: String containing test model suite names separated by semicolons
+        items: List of pytest items to filter
+        test_prefix: Test prefix if any
+        config: Pytest config object
+    """
+    if not test_model_suites:
+        return
+
+    # Split by semicolon or space and strip whitespace
+    suite_names = [
+        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
+        if suite.strip()
+    ]
+
+    if not suite_names:
+        return
+
+    selected = []
+    deselected = []
+
+    for item in items:
+        # Get the test name without prefix for comparison
+        test_name = item.nodeid
+        if test_prefix and test_name.startswith(f"{test_prefix}/"):
+            test_name = test_name[len(f"{test_prefix}/"):]
+
+        # Check if any suite name matches the test name
+        found = False
+        for suite_name in suite_names:
+            if suite_name in test_name or test_name.endswith(suite_name):
+                found = True
+                break
+
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
 
 
 def deselect_by_regex(regexp, items, test_prefix, config):
@@ -2251,6 +2176,10 @@ def check_nvlink():
 skip_nvlink_inactive = pytest.mark.skipif(check_nvlink() is False,
                                           reason="nvlink is inactive.")
 
+skip_ray = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="This test is skipped for Ray orchestrator.")
+
 
 @pytest.fixture(scope="function")
 def eval_venv(llm_venv):
@@ -2287,60 +2216,138 @@ IS_UNDER_CI_ENV = "JENKINS_HOME" in os.environ
 gpu_warning_threshold = 1024 * 1024 * 1024
 
 
+def get_gpu_memory_wo_pynvml():
+    import psutil
+
+    logger.warning(
+        f"pynvml not available, using fallback commands for memory monitoring")
+
+    gpu_memory = {}
+    system_total_mb = 0
+    system_used_mb = 0
+    try:
+        mem_output = check_output("free -m | awk '/^Mem:/ {print $3, $2}'",
+                                  shell=True)
+        parts = mem_output.strip().split()
+        system_used_mb = int(parts[0])
+        system_total_mb = int(parts[1])
+    except Exception:
+        pass
+
+    # Parse nvidia-smi pmon to get GPU memory usage
+    try:
+        gpu_output = check_output("nvidia-smi pmon -s m -c 1", shell=True)
+        lines = gpu_output.strip().split('\n')
+
+        for line in lines:
+            parts = line.split()
+            try:
+                gpu_idx = int(parts[0])
+
+                # Initialize GPU entry if not exists
+                if gpu_idx not in gpu_memory:
+                    gpu_memory[gpu_idx] = {
+                        "total_used": 0,
+                        "total": system_total_mb,
+                        "process": {}
+                    }
+
+                # Skip if no active process (pid is '-')
+                if parts[1] == '-':
+                    continue
+
+                pid = int(parts[1])
+                mem_mb = int(parts[3])
+                gpu_memory[gpu_idx]["total_used"] += mem_mb
+
+                # Get process info (same as pynvml version)
+                try:
+                    p = psutil.Process(pid)
+                    host_memory_in_mbs = p.memory_full_info(
+                    ).uss // 1024 // 1024
+                    gpu_memory[gpu_idx]["process"][pid] = (
+                        mem_mb,
+                        host_memory_in_mbs,
+                        p.cmdline(),
+                    )
+                except Exception:
+                    pass
+            except (ValueError, IndexError):
+                continue
+    except Exception as gpu_err:
+        logging.warning(f"nvidia-smi pmon error: {gpu_err}")
+
+    # Create default entry for GPU 0 if no GPUs detected
+    if not gpu_memory:
+        gpu_memory[0] = {
+            "total_used": system_used_mb,
+            "total": system_total_mb,
+            "process": {}
+        }
+    return gpu_memory
+
+
 def collect_status(item: pytest.Item):
     if not IS_UNDER_CI_ENV:
         return
 
     import psutil
-    import pynvml
-
-    pynvml.nvmlInit()
-
-    handles = {
-        idx: pynvml.nvmlDeviceGetHandleByIndex(idx)
-        for idx in range(pynvml.nvmlDeviceGetCount())
-    }
-
-    deadline = time.perf_counter() + 60  # 1 min
-    observed_used = 0
-    global gpu_warning_threshold
-
-    while time.perf_counter() < deadline:
-        observed_used = max(
-            pynvml.nvmlDeviceGetMemoryInfo(device).used
-            for device in handles.values())
-        if observed_used <= gpu_warning_threshold:
-            break
-        time.sleep(1)
-    else:
-        gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
-        warnings.warn(
-            f"Test {item.name} does not free up GPU memory correctly!")
 
     gpu_memory = {}
-    for idx, device in handles.items():
-        total_used = pynvml.nvmlDeviceGetMemoryInfo(device).used // 1024 // 1024
-        total = pynvml.nvmlDeviceGetMemoryInfo(device).total // 1024 // 1024
-        detail = pynvml.nvmlDeviceGetComputeRunningProcesses(device)
-        process = {}
 
-        for entry in detail:
-            try:
-                p = psutil.Process(entry.pid)
-                host_memory_in_mbs = p.memory_full_info().uss // 1024 // 1024
-                process[entry.pid] = (
-                    entry.usedGpuMemory // 1024 // 1024,
-                    host_memory_in_mbs,
-                    p.cmdline(),
-                )
-            except Exception:
-                pass
+    try:
+        import pynvml
+        pynvml.nvmlInit()
 
-        gpu_memory[idx] = {
-            "total_used": total_used,
-            "total": total,
-            "process": process
+        handles = {
+            idx: pynvml.nvmlDeviceGetHandleByIndex(idx)
+            for idx in range(pynvml.nvmlDeviceGetCount())
         }
+
+        deadline = time.perf_counter() + 60  # 1 min
+        observed_used = 0
+        global gpu_warning_threshold
+
+        while time.perf_counter() < deadline:
+            observed_used = max(
+                pynvml.nvmlDeviceGetMemoryInfo(device).used
+                for device in handles.values())
+            if observed_used <= gpu_warning_threshold:
+                break
+            time.sleep(1)
+        else:
+            gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
+            warnings.warn(
+                f"Test {item.name} does not free up GPU memory correctly!")
+
+        for idx, device in handles.items():
+            total_used = pynvml.nvmlDeviceGetMemoryInfo(
+                device).used // 1024 // 1024
+            total = pynvml.nvmlDeviceGetMemoryInfo(device).total // 1024 // 1024
+            detail = pynvml.nvmlDeviceGetComputeRunningProcesses(device)
+            process = {}
+
+            for entry in detail:
+                try:
+                    p = psutil.Process(entry.pid)
+                    host_memory_in_mbs = p.memory_full_info(
+                    ).uss // 1024 // 1024
+                    process[entry.pid] = (
+                        entry.usedGpuMemory // 1024 // 1024,
+                        host_memory_in_mbs,
+                        p.cmdline(),
+                    )
+                except Exception:
+                    pass
+
+            gpu_memory[idx] = {
+                "total_used": total_used,
+                "total": total,
+                "process": process
+            }
+    except Exception:
+        gpu_memory = get_gpu_memory_wo_pynvml()
+
     print("\nCurrent memory status:")
     print(gpu_memory)
 
@@ -2350,15 +2357,6 @@ def pytest_runtest_protocol(item, nextitem):
     ret = yield
     collect_status(item)
     return ret
-
-
-@pytest.fixture(scope="function")
-def deterministic_test_root(llm_root, llm_venv):
-    "Get deterministic test root"
-    deterministic_root = os.path.join(llm_root,
-                                      "tests/integration/defs/deterministic")
-
-    return deterministic_root
 
 
 @pytest.fixture(scope="function")
@@ -2428,4 +2426,14 @@ def torch_empty_cache() -> None:
     Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
     """
     if torch.cuda.is_available():
+        gc.collect()
         torch.cuda.empty_cache()
+        gc.collect()
+
+
+def pytest_runtest_setup(item):
+    _prefetch_hooks.pytest_runtest_setup(item)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

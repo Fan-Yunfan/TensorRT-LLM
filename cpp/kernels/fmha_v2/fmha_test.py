@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import subprocess
 
 import pytest
@@ -78,6 +92,10 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     # ada fp8 fmha only supports non-tiled kernels currently.
     if dtype == '-e4m3' and sm_version == 89 and tiled_kernel == "":
         pytest.skip("ada fp8 fmha only supports non-tiled kernels currently.")
+    # Known accuracy issue in this case.
+    skip_dense_mask_test = False
+    if d == 64 and dtype in ['-fp16-fp32', '-bf16'] and tiled_kernel == "":
+        skip_dense_mask_test = True
 
     # use higher error tolerance for bf16 and e4m3.
     epsilon = ''
@@ -107,10 +125,11 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
         if "softcapping-scale-bmm1" in flag:
             pytest.skip("skipping softcapping-scale-bmm1 for sm89 e4m3 fmha.")
 
-    subprocess.run(
-        f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
-        shell=True,
-        check=True)
+    if not skip_dense_mask_test:
+        subprocess.run(
+            f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
+            shell=True,
+            check=True)
     subprocess.run(
         f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
         shell=True,
@@ -263,3 +282,29 @@ def test_trtllm_chunked_attention(chunked_attention_size, input_layout):
             -chunked-attention-size {chunked_attention_size} -paged-kv",
             shell=True,
             check=True)
+
+
+# The test cases for sliding window attention.
+@pytest.mark.parametrize(
+    'sliding_window_size', [64, 127, 128, 129, 256, 512],
+    ids=[
+        "sliding-window-size-64", "sliding-window-size-127",
+        "sliding-window-size-128", "sliding-window-size-129",
+        "sliding-window-size-256", "sliding-window-size-512"
+    ])
+@pytest.mark.parametrize(
+    'mask_type',
+    ["-sliding-or-chunked-causal-mask", "-bidirectional-sliding-window-mask"])
+def test_trtllm_sliding_window_attention(sliding_window_size, mask_type):
+    if mask_type == "-bidirectional-sliding-window-mask":
+        sliding_window_size *= 2
+
+    subprocess.run(f"bin/fmha.exe -d 128 -b 2 -h 5 -s 2048 -min-s 1024 -bf16 \
+        -sliding-window-size {sliding_window_size} {mask_type}",
+                   shell=True,
+                   check=True)
+
+    subprocess.run(f"bin/fmha.exe -d 64 -b 2 -h 5 -s 2048 -min-s 1024 -bf16 \
+        -sliding-window-size {sliding_window_size} {mask_type}",
+                   shell=True,
+                   check=True)

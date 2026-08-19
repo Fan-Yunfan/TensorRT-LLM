@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,8 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import nn
 
+from ..utils import maybe_compile
+
 
 class LayerNorm(nn.Module):
     """Layer normalization module with configurable weight and bias parameters.
@@ -32,6 +34,9 @@ class LayerNorm(nn.Module):
         device: Optional device for parameters.
         has_weights: Whether to include learnable weight parameters.
         has_bias: Whether to include learnable bias parameters.
+        residual_in_fp32: Whether to accumulate the residual in FP32 before
+            normalization. If false, preserve the input dtype for the residual
+            addition and convert the result to FP32 for normalization.
     """
 
     def __init__(
@@ -43,6 +48,7 @@ class LayerNorm(nn.Module):
         device: Optional[torch.device] = None,
         has_weights: bool = True,
         has_bias: bool = True,
+        residual_in_fp32: bool = True,
     ):
         super().__init__()
         if has_weights:
@@ -64,7 +70,9 @@ class LayerNorm(nn.Module):
                                              device=device),
                                  persistent=False)
         self.variance_epsilon = eps
+        self.residual_in_fp32 = residual_in_fp32
 
+    @maybe_compile(dynamic=True)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -81,18 +89,25 @@ class LayerNorm(nn.Module):
         """
 
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
         if isinstance(residual, torch.Tensor):
-            hidden_states = hidden_states + residual.to(torch.float32)
+            if self.residual_in_fp32:
+                hidden_states = hidden_states.to(torch.float32) + residual.to(
+                    torch.float32)
+            else:
+                hidden_states = (hidden_states + residual).to(torch.float32)
             residual = hidden_states.to(input_dtype)
+        else:
+            hidden_states = hidden_states.to(torch.float32)
 
+        # Eager torch.layer_norm needs weight/bias in the fp32 compute dtype;
+        # torch.compile does this promotion implicitly (bitwise-identical).
         hidden_states = nn.functional.layer_norm(
             hidden_states,
-            hidden_states.shape[-1],
-            weight=self.weight,
-            bias=self.bias,
+            (hidden_states.shape[-1], ),
+            weight=self.weight.to(torch.float32),
+            bias=self.bias.to(torch.float32),
             eps=self.variance_epsilon,
-        )
+        ).to(input_dtype)
 
         if residual is ...:
             return hidden_states

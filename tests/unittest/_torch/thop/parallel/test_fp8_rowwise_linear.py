@@ -1,13 +1,12 @@
 import pytest
 import torch
-from utils.util import skip_blackwell, skip_pre_hopper
+from utils.util import skip_blackwell
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 @skip_blackwell
-@skip_pre_hopper
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fp8_rowwise_linear(dtype):
     SEQ_LEN = 10
@@ -43,7 +42,7 @@ def test_fp8_rowwise_linear(dtype):
     with torch.inference_mode():
         x_dq = x_fp8.to(x_scale.dtype) * x_scale.view(-1, 1)
         w_dq = w_fp8.to(w_scale.dtype).t() * w_scale.view(1, -1)
-        ref_output = x_dq.to(dtype) @ w_dq.to(dtype)
+        ref_output = (x_dq.float() @ w_dq.float()).to(dtype)
 
     # compare
     torch.cuda.synchronize()

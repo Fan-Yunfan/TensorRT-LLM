@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,11 +44,18 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
+import os
 from typing import Union
 
+import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
+import cutlass.cute as cute
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 # WAR for CuTeDSL make_ptr implementation
@@ -186,3 +193,284 @@ def make_ptr(
                     dtype,
                     mem_space,
                     assumed_align=assumed_align)
+
+
+def is_power_of_2(x: int) -> bool:
+    return x > 0 and (x & (x - 1)) == 0
+
+
+@dsl_user_op
+def fmin(a: Union[float, cutlass.Float32],
+         b: Union[float, cutlass.Float32],
+         *,
+         nan=False,
+         loc=None,
+         ip=None) -> cutlass.Float32:
+    return cutlass.Float32(
+        nvvm.fmin(
+            cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            nan=nan,
+            loc=loc,
+            ip=ip,
+        ))
+
+
+@dsl_user_op
+def fclip_xorsign(a: Union[float, cutlass.Float32],
+                  limit: Union[float, cutlass.Float32],
+                  *,
+                  loc=None,
+                  ip=None) -> cutlass.Float32:
+    """Symmetric clip.
+
+    Emits PTX ``min.xorsign.abs.f32`` with semantics
+    ``d = sign(a XOR limit) * min(|a|, |limit|)``.
+    When ``limit > 0`` this equals ``clip(a, -limit, +limit)``.
+
+    Requires sm_86+.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(limit).ir_value(loc=loc, ip=ip),
+            ],
+            "min.xorsign.abs.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+
+def sigmoid_f32(a: Union[float, cutlass.Float32],
+                fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the sigmoid of the input tensor.
+    """
+    return cute.arch.rcp_approx(1.0 + cute.math.exp(-a, fastmath=fastmath))
+
+
+def silu_f32(a: Union[float, cutlass.Float32],
+             fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the silu of the input tensor.
+    """
+    return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+def gelu_tanh_f32(a: Union[float, cutlass.Float32],
+                  fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the tanh approximation of GELU (matches F.gelu(approximate="tanh")).
+
+    gelu(a) = 0.5 * a * (1 + tanh(c * (a + 0.044715 * a^3))),  c = sqrt(2/pi)
+            = a * sigmoid(2c * (a + 0.044715 * a^3))
+
+    using the identity tanh(z) = 2 * sigmoid(2z) - 1, so the activation reuses
+    the same exp2-based sigmoid as silu_f32.
+    """
+    c2 = 1.5957691216057308  # 2 * sqrt(2/pi)
+    inner = c2 * (a + 0.044715 * a * a * a)
+    return a * sigmoid_f32(inner, fastmath=fastmath)
+
+
+# TODO(zhichenj): try to move these to NVVM wrapper or helper functions
+@dsl_user_op
+def vectorized_atomic_add_bf16x8(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def vectorized_atomic_add_fp16x8(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
+            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
+        ],
+        "red.global.v4.f16x2.add.noftz [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def vectorized_atomic_add_fp32x2(rOut_epi_packed,
+                                 scatter_out_offset,
+                                 loc=None,
+                                 ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            scatter_out_offset.iterator.llvm_ptr,
+            rOut_epi_packed[0].ir_value(),
+            rOut_epi_packed[1].ir_value(),
+        ],
+        "red.global.v2.f32.add [$0], {$1, $2};",
+        "l,f,f",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
+    if cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float32):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                rOut_epi_packed.ir_value(),
+            ],
+            "red.global.add.f32 [$0], $1;",
+            "l,f",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.BFloat16):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
+            ],
+            "red.add.noftz.bf16 [$0], $1;",
+            "l,h",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float16):
+        llvm.inline_asm(
+            None,
+            [
+                scatter_out_offset.iterator.llvm_ptr,
+                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
+            ],
+            "red.add.noftz.f16 [$0], $1;",
+            "l,h",
+            has_side_effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+
+@dsl_user_op
+def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.noftz.f16 [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_wait(*, loc=None, ip=None) -> None:
+    """
+    This instruction is used to wait for the previous kernel's grid ending
+    (all blocks of the previous kernel have finished and memflushed), i.e.,
+    the instruction after this instruction will not be issued until the previous
+    grid has finished.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.wait;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
+    """
+    Issuing the launch_dependents instruction hints a dependent kernel to launch earlier.
+    launch_dependents doesn't impact the functionality but the performance:
+    Launching a dependent kernel too early can compete with current kernels,
+    while launching too late can lead to a long latency.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="griddepcontrol.launch_dependents;",
+        constraints="",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )

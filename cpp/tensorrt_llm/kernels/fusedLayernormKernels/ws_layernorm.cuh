@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -25,7 +26,9 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 struct DummyFusedOperator
@@ -37,7 +40,7 @@ struct DummyFusedOperator
     }
 
     template <size_t ELEMS_PER_THREAD, typename T>
-    __device__ __forceinline__ void post_process(int m, int n_base, T packed_input)
+    __device__ __forceinline__ void post_process(int m, int n_base, T packed_input, bool write_output = true)
     {
     }
 };
@@ -198,25 +201,35 @@ struct WarpSpecializedLayerNorm
                 }
                 // if (blockIdx.x == 0) printf("Pushed tile %d to MATH.\n", m_base);
 
+                if constexpr (FIRST_RUN)
+                {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+                    if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+                    {
+                        // Ensure upstream kernel writes are visible before reading dependent activation/residual data.
+                        cudaGridDependencySynchronize();
+                    }
+#endif
+                }
+                const uint32_t eff_m_block
+                    = std::min(static_cast<uint32_t>(Traits::M_BLOCK), static_cast<uint32_t>(param.m - m_base));
                 const auto tx
-                    = (Traits::M_BLOCK * param.n * sizeof(typename Traits::InputType) * (Traits::RESIDUAL ? 2 : 1))
-                    + (FIRST_RUN ? sizeof(AuxData) / Traits::N_BLOCK * param.n : 0);
+                    = (eff_m_block * param.n * sizeof(typename Traits::InputType) * (Traits::RESIDUAL ? 2 : 1))
+                    + (FIRST_RUN ? (sizeof(AuxData) / Traits::N_BLOCK * param.n) : 0);
 
                 auto vec_buffer_ptr = input_vec_fifo_w.tmaReserve(tx);
 
                 // if (blockIdx.x == 0) printf("SMEM buffer ready, start loading tile %d.\n", m_base);
 
-                if constexpr (FIRST_RUN)
-                {
-                    asm volatile("griddepcontrol.wait;\n");
-                }
-
                 for (int i = 0; i < Traits::M_BLOCK; i++)
                 {
-                    load_a_vec(&param.input[(m_base + i) * param.n],
-                        __nvvm_get_smem_pointer(&shared->input_vec[vec_buffer_ptr][0][i * Traits::N_BLOCK]),
-                        param.n * sizeof(typename Traits::InputType),
-                        __nvvm_get_smem_pointer(input_vec_fifo_w.barrier_ptr(vec_buffer_ptr)));
+                    if (i < eff_m_block) [[likely]]
+                    {
+                        load_a_vec(&param.input[(m_base + i) * param.n],
+                            __nvvm_get_smem_pointer(&shared->input_vec[vec_buffer_ptr][0][i * Traits::N_BLOCK]),
+                            param.n * sizeof(typename Traits::InputType),
+                            __nvvm_get_smem_pointer(input_vec_fifo_w.barrier_ptr(vec_buffer_ptr)));
+                    }
                 }
 
                 // Use templated lambdas to defer resolving the symbols like "param.residual".
@@ -228,10 +241,13 @@ struct WarpSpecializedLayerNorm
                     {
                         for (int i = 0; i < Traits::M_BLOCK; i++)
                         {
-                            load_a_vec(&param.residual[(m_base + i) * param.n],
-                                __nvvm_get_smem_pointer(&shared->input_vec[vec_buffer_ptr][1][i * Traits::N_BLOCK]),
-                                param.n * sizeof(typename Traits::InputType),
-                                __nvvm_get_smem_pointer(input_vec_fifo_w.barrier_ptr(vec_buffer_ptr)));
+                            if (i < eff_m_block) [[likely]]
+                            {
+                                load_a_vec(&param.residual[(m_base + i) * param.n],
+                                    __nvvm_get_smem_pointer(&shared->input_vec[vec_buffer_ptr][1][i * Traits::N_BLOCK]),
+                                    param.n * sizeof(typename Traits::InputType),
+                                    __nvvm_get_smem_pointer(input_vec_fifo_w.barrier_ptr(vec_buffer_ptr)));
+                            }
                         }
                     }(param);
                 }
@@ -420,6 +436,13 @@ struct WarpSpecializedLayerNorm
 
         using FusedOperator = GetFusedOperator<typename Traits::FusedOperator>;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            // Ensure upstream kernel writes are visible before reading dependent activation/residual data.
+            cudaGridDependencySynchronize();
+        }
+#endif
         FusedOperator fused_operator(param);
 
         static_assert(Traits::PERSISTENT_MODE || Traits::MATH_WARPGROUPS == 1);
@@ -443,6 +466,9 @@ struct WarpSpecializedLayerNorm
             {
                 m_base = block_id;
             }
+            const uint32_t eff_m_block
+                = std::min(static_cast<uint32_t>(Traits::M_BLOCK), static_cast<uint32_t>(param.m - m_base));
+
             // if (blockIdx.x == 0 && thread_id == 0) printf("MATH got tile %d.\n", m_base);
 
             // Peek for data ready.
@@ -610,11 +636,12 @@ struct WarpSpecializedLayerNorm
                 {
                     mean[m_offset] /= param.n;
                     variance[m_offset] = rsqrtf(variance[m_offset] / param.n - mean[m_offset] * mean[m_offset]
-                        + (Traits::AccumulatorType)(1e-5));
+                        + (Traits::AccumulatorType)(param.layernorm_eps));
                 }
                 else
                 {
-                    variance[m_offset] = rsqrtf(variance[m_offset] / param.n + (Traits::AccumulatorType)(1e-5));
+                    variance[m_offset]
+                        = rsqrtf(variance[m_offset] / param.n + (Traits::AccumulatorType)(param.layernorm_eps));
                 }
             }
 
@@ -628,9 +655,14 @@ struct WarpSpecializedLayerNorm
 
                 auto n_base = (thread_id + i * 128) * Traits::PACKED_ELEMS_PER_COMPUTE;
                 auto in_bound = n_base < param.n;
-                if (!in_bound)
+
+                // FP4Converter uses __shfl_xor_sync — all warp threads must stay converged.
+                if constexpr (std::is_same_v<typename Traits::FusedOperator, void>)
                 {
-                    break;
+                    if (!in_bound)
+                    {
+                        break;
+                    }
                 }
 
                 if constexpr (Traits::GAMMA)
@@ -656,15 +688,14 @@ struct WarpSpecializedLayerNorm
                     }
                 }
 
-#pragma unroll Traits::M_BLOCK
-                for (int m_offset = 0; m_offset < Traits::M_BLOCK; m_offset++)
+                for (int m_offset = 0; m_offset < eff_m_block; m_offset++)
                 {
                     auto m = m_base + m_offset;
 
                     typename PackType<typename Traits::OutputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                         normed_output;
                     typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type output;
-                    typename PackType<typename Traits::AccumulatorType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
+                    typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                         high_precision_normed_output;
 
 #pragma unroll Traits::PACKED_ELEMS_PER_COMPUTE
@@ -693,6 +724,11 @@ struct WarpSpecializedLayerNorm
                             normed_out += beta[j];
                         }
 
+                        if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
+                        {
+                            high_precision_normed_output.array[j] = (typename Traits::InputType) normed_out;
+                        }
+
                         if constexpr (Traits::OUTPUT_SCALE != SCALE_TYPE::NONE)
                         {
                             static_assert(Traits::OUTPUT_SCALE == SCALE_TYPE::SCALAR);
@@ -702,11 +738,6 @@ struct WarpSpecializedLayerNorm
                         if constexpr (Traits::UNNORMED_OUTPUT)
                         {
                             output.array[j] = (typename Traits::InputType) data[m_offset][i][j];
-                        }
-
-                        if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
-                        {
-                            high_precision_normed_output.array[j] = normed_out;
                         }
 
                         normed_output.array[j] = (typename Traits::OutputType) normed_out;
@@ -727,16 +758,22 @@ struct WarpSpecializedLayerNorm
                             = normed_output;
                         if constexpr (Traits::UNNORMED_OUTPUT)
                         {
-                            reinterpret_cast<decltype(output)*>(
-                                &shared->output_vec[0][buffer_id][m_offset * Traits::N_BLOCK + n_base])[0]
-                                = output;
+                            if (in_bound)
+                            {
+                                reinterpret_cast<decltype(output)*>(
+                                    &shared->output_vec[0][buffer_id][m_offset * Traits::N_BLOCK + n_base])[0]
+                                    = output;
+                            }
                         }
                     }
                     else
                     {
                         if constexpr (Traits::UNNORMED_OUTPUT)
                         {
-                            reinterpret_cast<decltype(output)*>(&param.output[m * param.n + n_base])[0] = output;
+                            if (in_bound)
+                            {
+                                reinterpret_cast<decltype(output)*>(&param.output[m * param.n + n_base])[0] = output;
+                            }
                         }
                         // TODO: Move this generic writeback into dummy fused operator.
                         if constexpr (std::is_same_v<typename Traits::FusedOperator, void>)
@@ -748,13 +785,16 @@ struct WarpSpecializedLayerNorm
                         {
                             fused_operator
                                 .template post_process<Traits::PACKED_ELEMS_PER_COMPUTE, decltype(normed_output)>(
-                                    m, n_base, normed_output);
+                                    m, n_base, normed_output, in_bound);
                         }
                         if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
                         {
-                            reinterpret_cast<decltype(high_precision_normed_output)*>(
-                                &param.high_precision_normed_output[m * param.n + n_base])[0]
-                                = high_precision_normed_output;
+                            if (in_bound)
+                            {
+                                reinterpret_cast<decltype(high_precision_normed_output)*>(
+                                    &param.high_precision_normed_output[m * param.n + n_base])[0]
+                                    = high_precision_normed_output;
+                            }
                         }
                     }
                 }
@@ -798,23 +838,19 @@ struct WarpSpecializedLayerNorm
         shared->init(threadIdx.x == 0);
 
         __syncthreads();
-#if (defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 12))
-#if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL))
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12)
         if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
         {
             auto block_id = blockIdx.x;
             auto warp_id = threadIdx.x / 32;
             auto lane_id = threadIdx.x % 32;
             auto tid_in_wg = threadIdx.x % 128;
-
             if (warp_id < 4)
             {
                 asm volatile("{setmaxnreg.dec.sync.aligned.u32 56; \n\t}");
                 if (warp_id == 0)
                 {
                     scheduler(lane_id, gridDim.x * gridDim.y * gridDim.z, param, shared);
-                    // PRE-EXIT after all tiles have been scheduled.
-                    asm volatile("griddepcontrol.launch_dependents;\n");
                 }
                 else if (warp_id == 1)
                 {
@@ -826,8 +862,10 @@ struct WarpSpecializedLayerNorm
                 asm volatile("{setmaxnreg.inc.sync.aligned.u32 224; \n\t}");
                 compute(block_id, threadIdx.x / 128 - 1, tid_in_wg, param, shared);
             }
+            __syncthreads();
+            asm volatile("membar.gl;" : : : "memory");
+            cudaTriggerProgrammaticLaunchCompletion();
         }
-#endif
 #endif
     }
 };
@@ -838,4 +876,6 @@ __global__ void __launch_bounds__(TARGET_THREADS, 1) warpSpecializedInvoker(type
     T::run(param);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

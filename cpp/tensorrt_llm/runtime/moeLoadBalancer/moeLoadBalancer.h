@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -143,6 +143,12 @@ public:
         return mLayerId;
     }
 
+    std::vector<std::vector<int>> getOldRankExpertIds() const
+    {
+        // This API is only used in test_moe_module to check expert placement.
+        return mCpuPlacementInfo.oldRankExpertIds;
+    }
+
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo getMetaInfo() const
     {
         return mMetaInfo;
@@ -185,6 +191,9 @@ private:
     void waitCpuStage();
     void maybeStartUpdateWeights();
     void waitLastUpdateDone();
+    void validateMaskOnly(std::vector<uint8_t> const& deadRankMask) const;
+    void reconfigureMaskOnly(std::vector<uint8_t> const& deadRankMask);
+    std::vector<int> computeMaskOnlyReplicaCounts(std::vector<uint8_t> const& deadRankMask) const;
 
     MoeLoadBalancer* mMoeLoadBalancer = nullptr;
 
@@ -219,7 +228,7 @@ private:
 class MultiThreadWorker
 {
 public:
-    explicit MultiThreadWorker(int numThreads);
+    explicit MultiThreadWorker(int numThreads, int cudaDeviceId);
     ~MultiThreadWorker();
 
     void start();
@@ -239,6 +248,7 @@ private:
     void workerLoop(int rank);
 
     int mNumThreads;
+    int mCudaDeviceId;
     std::vector<std::thread> mThreads;
     std::mutex mMutex;
     std::condition_variable mCondition;
@@ -276,6 +286,11 @@ public:
     // should bind to python
     void shutdown();
 
+    // should bind to python
+    // This API only validates placement safety, i.e. every expert keeps at least one surviving replica.
+    // The caller must separately gate degraded-mode capacity/HBM headroom before invoking it.
+    void reconfigureMaskOnly(std::vector<int> const& deadRanks);
+
     // Test interface to use GPU to do memcpy test functionality
     void setUseGpuMemcpy(bool useGpuMemcpy = false)
     {
@@ -305,6 +320,7 @@ private:
     void addUpdateTask(std::function<void()> task);
     int64_t addCopyTask(std::function<void(int, int)> task);
     void waitCopyTaskDone(int64_t taskId);
+    std::vector<uint8_t> getDeadRankMaskSnapshot();
 
     std::vector<std::shared_ptr<SingleLayerMoeLoadBalancer>> mLayers;
 
@@ -320,6 +336,7 @@ private:
     std::queue<IterInfo> mIterInfoQueue;
 
     bool mModelFinalized = false;
+    bool mIterActive = false;
 
     int mEpRank = 0;
     int mEpSize = 1;
@@ -332,6 +349,9 @@ private:
 
     std::unique_ptr<MultiThreadWorker> mMultiThreadWorker;
 
+    std::mutex mDeadRankMaskMutex;
+    std::vector<uint8_t> mDeadRankMask;
+
     // update plan member and function
     int mLayerUpdatesPerIter = 1;
     std::deque<std::set<int>> mUpdateLayerQueue;
@@ -342,9 +362,9 @@ private:
 
 // functions exposed for testing
 void doReplication(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
-    MoePlacementCpuInfo* cpuPlacement);
+    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr);
 
 void doPlacement(tensorrt_llm::kernels::MoeLoadBalanceMetaInfo metaInfo, float* const expertLoadFactor,
-    MoePlacementCpuInfo* cpuPlacement);
+    MoePlacementCpuInfo* cpuPlacement, std::vector<uint8_t> const* deadRankMask = nullptr);
 
 } // namespace tensorrt_llm::runtime

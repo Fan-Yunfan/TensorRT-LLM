@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "cutlass/numeric_types.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -25,6 +26,8 @@
     && ((TORCH_VERSION_MAJOR > 1) || ((TORCH_VERSION_MAJOR == 1) && (TORCH_VERSION_MINOR >= 9)))
 #define TORCH_IS_AT_LEAST_v190
 #endif
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -108,11 +111,12 @@ std::tuple<Tensor, Tensor> e4m3_quantize_helper(Tensor input, at::optional<Tenso
 
     if (scales.has_value())
     {
-        // static quantization will use float scales by default.
-        scales_ = scales.value();
-        CHECK_TH_CUDA(scales_);
-        CHECK_TYPE(scales_, torch::kFloat32);
-        e4m3_static_quantize(input, quantized_input, scales_, stream, quantize_mode);
+        // static quantization will use float scales by default and output scales_ will be ignored.
+        scales_
+            = torch::empty_like(scales.value(), torch::dtype(input.dtype()).device(torch::kCUDA).requires_grad(false));
+        CHECK_TH_CUDA(scales.value());
+        CHECK_TYPE(scales.value(), torch::kFloat32);
+        e4m3_static_quantize(input, quantized_input, scales.value(), stream, quantize_mode);
     }
     else
     {
@@ -370,6 +374,8 @@ Tensor symmetric_dequantize_per_tensor(Tensor input, Tensor scales)
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 // Utility methods that may be useful for preprocessing weights in torch.
 TORCH_LIBRARY_FRAGMENT(tensorrt_llm, m)
 {
@@ -386,19 +392,19 @@ TORCH_LIBRARY_FRAGMENT(tensorrt_llm, m)
 
 TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
 {
-    m.impl("quantize_e4m3_weight", &torch_ext::symmetric_quantize_weight);
-    m.impl("quantize_e4m3_activation", &torch_ext::symmetric_quantize_activation);
-    m.impl("quantize_e4m3_per_tensor", &torch_ext::symmetric_quantize_per_tensor);
-    m.impl("static_quantize_e4m3_weight", &torch_ext::symmetric_static_quantize_weight);
-    m.impl("static_quantize_e4m3_activation", &torch_ext::symmetric_static_quantize_activation);
-    m.impl("static_quantize_e4m3_per_tensor", &torch_ext::symmetric_static_quantize_per_tensor);
-    m.impl("dequantize_e4m3_weight", &torch_ext::symmetric_dequantize_weight);
-    m.impl("dequantize_e4m3_activation", &torch_ext::symmetric_dequantize_activation);
-    m.impl("dequantize_e4m3_per_tensor", &torch_ext::symmetric_dequantize_per_tensor);
+    m.impl("quantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_quantize_weight);
+    m.impl("quantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_quantize_activation);
+    m.impl("quantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_quantize_per_tensor);
+    m.impl("static_quantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_static_quantize_weight);
+    m.impl("static_quantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_static_quantize_activation);
+    m.impl("static_quantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_static_quantize_per_tensor);
+    m.impl("dequantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_dequantize_weight);
+    m.impl("dequantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_dequantize_activation);
+    m.impl("dequantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_dequantize_per_tensor);
 }
 
-static auto dequantize_mxe4m3_host
-    = torch::RegisterOperators("tensorrt_llm::dequantize_mxe4m3_host", &torch_ext::dequantize_mxe4m3_host);
+static auto dequantize_mxe4m3_host = torch::RegisterOperators(
+    "tensorrt_llm::dequantize_mxe4m3_host", &tensorrt_llm::torch_ext::dequantize_mxe4m3_host);
 
 static auto quantize_mxe4m3_host
-    = torch::RegisterOperators("tensorrt_llm::quantize_mxe4m3_host", &torch_ext::quantize_mxe4m3_host);
+    = torch::RegisterOperators("tensorrt_llm::quantize_mxe4m3_host", &tensorrt_llm::torch_ext::quantize_mxe4m3_host);

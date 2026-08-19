@@ -1,6 +1,8 @@
 # 🔥🚀⚡ AutoDeploy Examples
 
-This folder contains runnable examples for **AutoDeploy**. For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/torch/auto_deploy/auto-deploy.html).
+This folder contains runnable examples for **AutoDeploy** as it ships inside [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
+
+> Looking for the lightweight standalone package (no TRT-LLM required)? See **Paragraf** at [github.com/NVIDIA/llm-compiler](https://github.com/NVIDIA/llm-compiler). That repo is generated from this source tree by [`paragraf/create_standalone_package.py`](./paragraf/create_standalone_package.py).
 
 ______________________________________________________________________
 
@@ -12,7 +14,7 @@ AutoDeploy is included with the TRT-LLM installation.
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
-You can refer to [TRT-LLM installation guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/linux.md) for more information.
+You can refer to the [TRT-LLM installation guide](../../docs/source/installation/installation-guide.md) for more information.
 
 Run a simple example with a Hugging Face model:
 
@@ -25,7 +27,7 @@ ______________________________________________________________________
 
 ## Example Run Script ([`build_and_run_ad.py`](./build_and_run_ad.py))
 
-This script demonstrates end-to-end deployment of HuggingFace checkpoints using AutoDeploy’s graph-transformation pipeline.
+This script demonstrates end-to-end deployment of HuggingFace checkpoints using AutoDeploy's graph-transformation pipeline.
 
 You can configure your experiment with various options. Use the `-h/--help` flag to see available options:
 
@@ -38,6 +40,8 @@ Below is a non-exhaustive list of common configuration options:
 | Configuration Key | Description |
 |-------------------|-------------|
 | `--model` | The HF model card or path to a HF checkpoint folder |
+| `--use-registry` | Auto-populate `args.yaml_extra` from `model_registry/models.yaml` for the chosen model |
+| `--registry-config-id` | Select a specific registry `config_id` when a model has multiple registry entries |
 | `--args.model-factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
 | `--args.skip-loading-weights` | Only load the architecture, not the weights |
 | `--args.model-kwargs` | Extra kwargs that are being passed to the model initializer in the model factory |
@@ -49,7 +53,6 @@ Below is a non-exhaustive list of common configuration options:
 | `--args.mla-backend` | Specifies implementation for multi-head latent attention |
 | `--args.max-seq-len` | Maximum sequence length for inference/cache |
 | `--args.max-batch-size` | Maximum dimension for statically allocated KV cache |
-| `--args.attn-page-size` | Page size for attention |
 | `--prompt.batch-size` | Number of queries to generate |
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
@@ -66,6 +69,17 @@ python build_and_run_ad.py \
 --args.compile-backend "torch-compile" \
 --args.attn-backend "flashinfer" \
 --benchmark.enabled True
+
+# Pull yaml_extra directly from model_registry/models.yaml
+python build_and_run_ad.py \
+--model "meta-llama/Llama-3.1-8B-Instruct" \
+--use-registry
+
+# Select a specific config_id when the model has multiple registry entries
+python build_and_run_ad.py \
+--model "meta-llama/Llama-3.1-8B-Instruct" \
+--use-registry \
+--registry-config-id default_ws_2
 ```
 
 ### Advanced Configuration
@@ -90,16 +104,16 @@ python lm_eval_ad.py \
 --model autodeploy --model_args model=meta-llama/Meta-Llama-3.1-8B-Instruct,world_size=2 --tasks mmlu
 ```
 
-### Mixed-precision Quantization using TensorRT Model Optimizer
+### Mixed-precision Quantization using Model Optimizer
 
-TensorRT Model Optimizer [AutoQuantize](https://nvidia.github.io/TensorRT-Model-Optimizer/reference/generated/modelopt.torch.quantization.model_quant.html#modelopt.torch.quantization.model_quant.auto_quantize) algorithm is a PTQ algorithm from ModelOpt which quantizes a model by searching for the best quantization format per-layer while meeting the performance constraint specified by the user. This way, `AutoQuantize` enables to trade-off model accuracy for performance.
+Model Optimizer [AutoQuantize](https://nvidia.github.io/Model-Optimizer/reference/generated/modelopt.torch.quantization.model_quant.html#modelopt.torch.quantization.model_quant.auto_quantize) algorithm is a PTQ algorithm from ModelOpt which quantizes a model by searching for the best quantization format per-layer while meeting the performance constraint specified by the user. This way, `AutoQuantize` enables to trade-off model accuracy for performance.
 
 Currently `AutoQuantize` supports only `effective_bits` as the performance constraint (for both weight-only quantization and weight & activation quantization). See
-[AutoQuantize documentation](https://nvidia.github.io/TensorRT-Model-Optimizer/reference/generated/modelopt.torch.quantization.model_quant.html#modelopt.torch.quantization.model_quant.auto_quantize) for more details.
+[AutoQuantize documentation](https://nvidia.github.io/Model-Optimizer/reference/generated/modelopt.torch.quantization.model_quant.html#modelopt.torch.quantization.model_quant.auto_quantize) for more details.
 
 #### 1. Quantize a model with ModelOpt
 
-Refer to [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/examples/llm_autodeploy/README.md) for generating quantized model checkpoint.
+Refer to [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/llm_autodeploy/README.md) for generating quantized model checkpoint.
 
 #### 2. Deploy the quantized model with AutoDeploy
 
@@ -110,36 +124,24 @@ python build_and_run_ad.py --model "<MODELOPT_CKPT_PATH>" --args.world-size 1
 
 ### Incorporating `auto_deploy` into your own workflow
 
-AutoDeploy can be seamlessly integrated into your existing workflows using TRT-LLM's LLM high-level API. This section provides a blueprint for configuring and invoking AutoDeploy within your custom applications.
+AutoDeploy can be integrated into your existing workflows. When using TRT-LLM, use the LLM high-level API:
 
-Here is an example of how you can build an LLM object with AutoDeploy integration:
-
-```
+```python
+# With TensorRT-LLM
 from tensorrt_llm._torch.auto_deploy import LLM
 
-
-# Construct the LLM high-level interface object with autodeploy as backend
 llm = LLM(
     model=<HF_MODEL_CARD_OR_DIR>,
     world_size=<DESIRED_WORLD_SIZE>,
     compile_backend="torch-compile",
-    model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
-    attn_backend="flashinfer", # choose between "triton" and "flashinfer"
-    attn_page_size=64, # page size for attention (tokens_per_block, should be == max_seq_len for triton)
+    model_kwargs={"num_hidden_layers": 2},
+    attn_backend="flashinfer",
     skip_loading_weights=False,
-    model_factory="AutoModelForCausalLM", # choose appropriate model factory
-    mla_backend="MultiHeadLatentAttention", # for models that support MLA
-    free_mem_ratio=0.8, # fraction of available memory for cache
-    simple_shard_only=False, # tensor parallelism sharding strategy
+    model_factory="AutoModelForCausalLM",
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )
-
 ```
-
-Please consult the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py) and the
-[`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
-for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` API.
 
 ### Expert Configuration of LLM API
 
@@ -218,15 +220,15 @@ args:
     num_hidden_layers: 12
     hidden_size: 1024
   world_size: 4
-  compile_backend: torch-compile
-  attn_backend: triton
   max_seq_len: 2048
   max_batch_size: 16
   transforms:
-    sharding:
-      strategy: auto
-    quantization:
-      enabled: false
+    apply_sharding_hints:
+      allreduce_strategy: SYMM_MEM
+    insert_cached_attention:
+      backend: triton
+    compile_model:
+      backend: torch-compile
 
 prompt:
   batch_size: 8
@@ -234,13 +236,6 @@ prompt:
     max_tokens: 150
     temperature: 0.8
     top_k: 50
-
-benchmark:
-  enabled: true
-  num: 20
-  bs: 4
-  isl: 1024
-  osl: 256
 ```
 
 Create an additional override file (e.g., `production.yaml`):
@@ -249,11 +244,10 @@ Create an additional override file (e.g., `production.yaml`):
 # production.yaml
 args:
   world_size: 8
-  compile_backend: torch-opt
   max_batch_size: 32
-
-benchmark:
-  enabled: false
+  transforms:
+    compile_model:
+      backend: torch-opt
 ```
 
 Then use these configurations:
@@ -262,18 +256,18 @@ Then use these configurations:
 # Using single YAML config
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml
+  --yaml-extra my_config.yaml
 
 # Using multiple YAML configs (deep merged in order, later files have higher priority)
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml production.yaml
+  --yaml-extra my_config.yaml production.yaml
 
 # Targeting nested AutoDeployConfig with separate YAML
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs my_config.yaml \
-  --args.yaml-configs autodeploy_overrides.yaml
+  --yaml-extra my_config.yaml \
+  --args.yaml-extra autodeploy_overrides.yaml
 ```
 
 #### Configuration Precedence and Deep Merging
@@ -281,7 +275,8 @@ python build_and_run_ad.py \
 The configuration system follows a strict precedence order where higher priority sources override lower priority ones:
 
 1. **CLI Arguments** (highest priority) - Direct command line arguments
-1. **YAML Configs** - Files specified via `--yaml-configs` and `--args.yaml-configs`
+1. **YAML Extra Configs** - Files specified via `--yaml-extra` and `--args.yaml-extra`
+1. **YAML Default Config** - (**do not change**) Files specified via `--yaml-default` and `--args.yaml-default`
 1. **Default Settings** (lowest priority) - Built-in defaults from the config classes
 
 **Deep Merging**: Unlike simple overwriting, deep merging intelligently combines nested dictionaries recursively. For example:
@@ -307,18 +302,18 @@ args:
 **Nested Config Behavior**: When using nested configurations, outer YAML configs become init settings for inner objects, giving them higher precedence:
 
 ```bash
-# The outer yaml-configs affects the entire ExperimentConfig
-# The inner args.yaml-configs affects only the AutoDeployConfig
+# The outer yaml-extra affects the entire ExperimentConfig
+# The inner args.yaml-extra affects only the AutoDeployConfig
 python build_and_run_ad.py \
   --model "meta-llama/Meta-Llama-3.1-8B-Instruct" \
-  --yaml-configs experiment_config.yaml \
-  --args.yaml-configs autodeploy_config.yaml \
+  --yaml-extra experiment_config.yaml \
+  --args.yaml-extra autodeploy_config.yaml \
   --args.world-size=8  # CLI override beats both YAML configs
 ```
 
 #### Built-in Default Configuration
 
-Both [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the [`_get_config_dict()`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) function and defines default transform configurations for graph optimization stages.
+Both [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified via the [`yaml_default`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) field and defines default transform configurations for graph optimization stages.
 
 The built-in defaults are automatically merged with your configurations at the lowest priority level, ensuring that your custom settings always override the defaults. You can inspect the current default configuration to understand the baseline transform pipeline:
 
@@ -332,6 +327,8 @@ python build_and_run_ad.py \
   --args.transforms.export-to-gm.strict=true
 ```
 
+As indicated before, this can be overwritten via the `yaml_default` (`--yaml-default`) field but note that this will overwrite the entire Inference Optimizer pipeline.
+
 </details>
 
 ## Roadmap
@@ -341,4 +338,5 @@ the current progress in AutoDeploy and where you can help.
 
 ## Disclaimer
 
-This project is under active development and is currently in a prototype stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, there are no guarantees regarding functionality, stability, or reliability.
+This project is under active development and is currently released as beta feature. The code is
+subject to change, and may include backward-incompatible updates.

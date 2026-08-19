@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -88,15 +88,18 @@ add_custom_command(
 add_custom_target(xqa_sources_h DEPENDS ${XQA_SOURCES_H})
 
 if(BUILD_XQA_TESTS)
+  if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    get_filename_component(TRT_LLM_ROOT_DIR
+                           "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+    add_subdirectory("${TRT_LLM_ROOT_DIR}/3rdparty"
+                     "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+  endif()
+
   # Try to find system installed GTest first
   find_package(GTest QUIET)
   if(NOT GTest_FOUND)
     message(STATUS "System GTest not found, fetching from repository")
     include(FetchContent)
-    FetchContent_Declare(
-      googletest
-      GIT_REPOSITORY https://github.com/google/googletest.git
-      GIT_TAG v1.15.2)
     FetchContent_MakeAvailable(googletest)
     include(GoogleTest)
   endif()
@@ -106,10 +109,6 @@ if(BUILD_XQA_TESTS)
   if(NOT Eigen3_FOUND)
     message(STATUS "System Eigen not found, fetching from repository")
     include(FetchContent)
-    FetchContent_Declare(
-      eigen
-      GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-      GIT_TAG 3.4.0)
     FetchContent_MakeAvailable(eigen)
   endif()
 

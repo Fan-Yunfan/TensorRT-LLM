@@ -6,6 +6,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from ..base_weight_mapper import BaseWeightMapper
 
 
+@register_mapper("MX")
 @register_mapper("HF")
 class HfWeightMapper(BaseWeightMapper):
 
@@ -36,8 +37,8 @@ class HfWeightMapper(BaseWeightMapper):
         return module_weights
 
     def should_skip_module(self, module_name: str) -> bool:
-        if self.model.config.tie_word_embeddings and module_name.startswith(
-                "lm_head"):
+        if getattr(self.model.config, 'tie_word_embeddings',
+                   False) and module_name.startswith("lm_head"):
             return True
 
         # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
@@ -56,17 +57,29 @@ class HfWeightMapper(BaseWeightMapper):
 
         return super().should_skip_module(module_name)
 
+    @property
+    def _num_kv_heads(self) -> int:
+        config = self.model.config
+        if hasattr(config, 'num_key_value_heads'
+                   ) and config.num_key_value_heads is not None:
+            return config.num_key_value_heads
+        return config.num_attention_heads
+
     def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
                               weights: dict):
         if new_name in ['k_proj', 'v_proj']:
-            # k_proj and v_proj shape is [num_kv_heads*head_dim, hidden_dim]
-            num_kv_heads = weights['weight'].shape[0] // self._head_dim
+            num_kv_heads = self._num_kv_heads
+
+            duplicated_keys = ["weight", "bias"]
+            if module.quant_config.quant_mode.has_nvfp4():
+                duplicated_keys.append("weight_scale")
+
             processed_weights = {
                 k:
                 self._duplicate_kv(weight=v[:],
                                    num_kv_heads=num_kv_heads,
                                    tensor_parallel_size=self._tp_size)
-                if k in ["weight", "bias"] else v
+                if k in duplicated_keys else v
                 for k, v in weights.items()
             }
             return processed_weights

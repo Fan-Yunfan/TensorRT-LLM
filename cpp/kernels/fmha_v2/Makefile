@@ -1,18 +1,18 @@
 # ##################################################################################################
-#  Copyright (c) 2011-2023, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-#  Redistribution and use in source and binary forms, with or without modification, are not permit-
-#  ted.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
-#  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
-#  FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
-#  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFIT;
-#  OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-#  STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-#  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ##################################################################################################
 
 # #################################################################################################
@@ -69,6 +69,11 @@ PREPROCESSOR_FLAGS += -DUSE_SAME_SUM_ORDER_IN_SOFTMAX_AS_REF_CODE
 # Do we want to use half accumulation for flash attention
 PREPROCESSOR_FLAGS += -DHALF_ACCUMULATION_FOR_FLASH_ATTENTION
 
+# Print the resulted sparsity given threshold in Skip-Softmax attention
+# Note: You only need to "python scripts/build_wheel.py -D SKIP_SOFTMAX_STAT=ON ..." to use it inside TRTLLM.
+# Turn this on manually only if you want to build&run the unittest (bin/fmha.exe) with SKIP_SOFTMAX_STAT.
+# PREPROCESSOR_FLAGS += -DSKIP_SOFTMAX_STAT
+
 # Add FLAGS when generating cubins.
 ifdef GENERATE_CUBIN
 	PREPROCESSOR_FLAGS += -DGENERATE_CUBIN
@@ -119,8 +124,14 @@ ifneq ($(wildcard generated),)
 include generated/makefile
 endif
 
-CUBIN_CPP = $(patsubst %.cu.cubin, %.cubin.cpp, $(CUBINS))
-CUBIN_OBJ = $(patsubst %.cubin.cpp, %.cubin.o, $(CUBIN_CPP))
+# Each raw nvcc cubin is wrapped into a single-entry zstd-compressed tarball
+# matching the schema consumed by cpp/cmake/modules/tllm_cubin_archive.cmake.
+# The tarball entry is renamed `<stem>.cubin` (no `.cu` infix) so the build
+# extracts to the same on-disk filename consumers expect.
+# The legacy `xxd -i`-based bin2c flow (CUBIN_CPP / CUBIN_OBJ /
+# bin/libfmha_cubin.a) is gone -- consumer libraries pull cubin bytes in via
+# INCBIN at build time instead.
+CUBIN_TARS = $(patsubst %.cu.cubin, %.cubin.tar.zst, $(CUBINS))
 
 GENCODES =
 
@@ -179,13 +190,13 @@ dirs:
 	if [ ! -d bin/test/unit/arch ]; then mkdir -p bin/test/unit/arch; fi
 
 .PHONY: cubin
-cubin: $(CUBIN_CPP)
+cubin:
 	$(MAKE) dirs
-	$(MAKE) bin/libfmha_cubin.a
+	$(MAKE) $(CUBIN_TARS)
 
 cubin_demobert:
 	$(MAKE) dirs
-	$(MAKE) PREPROCESSOR_FLAGS="$(PREPROCESSOR_FLAGS) -DUSE_DEMO_BERT_PARAMS=1" $(CUBIN_CPP)
+	$(MAKE) PREPROCESSOR_FLAGS="$(PREPROCESSOR_FLAGS) -DUSE_DEMO_BERT_PARAMS=1" $(CUBIN_TARS)
 
 clean:
 	rm -rf bin obj cubin generated train_ops/build
@@ -230,9 +241,6 @@ bin/fmhca.exe: $(OBJECTS_MHCA)
 	$(CXX) $(CXX_FLAGS) -o $@ $^ -L$(CUDA)/lib64 -Wl,-rpath=$(CUDA)/lib64 -lcudart -lcudart -lcublas -lcublasLt
 
 ###################################################################################################
-
-bin/libfmha_cubin.a: $(CUBIN_OBJ)
-	ar rcs $@ $^
 
 ###################################################################################################
 
@@ -327,5 +335,23 @@ cubin/%_sm120.no_i2f_f2i.cu.cubin: ./generated/%_sm120.no_i2f_f2i.cu ./src/*.h .
 
 ###################################################################################################
 
-cubin/%.cubin.cpp: cubin/%.cu.cubin
-	xxd -i $< >& $@
+# Per-cubin tarball. The `cmake -E tar` invocation produces a single-entry
+# zstd archive whose entry is named "<stem>.cubin" (without the ".cu" infix),
+# matching the on-disk layout consumers expect after extraction.
+#
+# `--mtime=1970-01-01UTC` pins the archive entry's mtime, so two runs with
+# identical cubin bytes produce byte-identical tarballs. That is what lets
+# git/LFS dedupe across regenerations -- the tarball's content hash stays
+# stable when the input cubin's content does. The consumer-side build
+# (cpp/cmake/modules/tllm_cubin_archive.cmake) compensates for the frozen
+# entry mtime by copying the tarball file's mtime onto the extracted cubin
+# via `touch -r` -- otherwise ninja's restat optimization would mis-skip
+# downstream .o rebuilds.
+#
+# The hard-link / unlink dance keeps the cubin/ dir uncluttered between
+# builds.
+cubin/%.cubin.tar.zst: cubin/%.cu.cubin
+	@cd cubin && rm -f $*.cubin && \
+	  (ln $*.cu.cubin $*.cubin 2>/dev/null || cp $*.cu.cubin $*.cubin) && \
+	  cmake -E tar cf $*.cubin.tar.zst --zstd --mtime="1970-01-01UTC" -- $*.cubin && \
+	  rm -f $*.cubin

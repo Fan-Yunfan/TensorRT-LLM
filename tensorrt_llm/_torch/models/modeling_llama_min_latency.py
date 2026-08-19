@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections.abc import Callable
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -23,7 +38,7 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor
+from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
 
 # Perf heuristics thresholds.
@@ -88,9 +103,10 @@ class Llama4MinLatencyLinear(Linear):
         self.enable_trtllm_gen = enable_trtllm_gen
         self.position_ids = None
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool):
 
-        super().load_weights(weights)
+        super().load_weights(weights,
+                             allow_partial_loading=allow_partial_loading)
 
         # After loading weights, calculate the combined scale (input_scale * weight_scale) for special kernels and
         # trtllm-gen kernels.
@@ -307,7 +323,7 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
 
     # After loading both gate_up_proj and down_proj, we need to set the scales needed by the special kernels and by
     # the trtllm-gen gemm+swiglu kernel.
-    def post_load_weights(self):
+    def cache_derived_state(self) -> None:
         if self.gate_up_proj.has_fp8_qdq:
             # For the special gemm+swiglu kernel, we need to set the inverse of the output scale, which is the inverse
             # of down_proj's combined input scale.
@@ -315,6 +331,9 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
             # For the trtllm-gen gemm+swiglu kernel, we need to set the global scale, which is gate_up_proj's
             # combined input scale times inv_output_scale.
             self.gate_up_proj.trtllm_gen_global_scale = self.gate_up_proj.combined_scale * self.gate_up_proj.inv_output_scale
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def forward(
         self,
@@ -438,7 +457,8 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: torch.cuda.Stream = torch.cuda.Stream(),
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
@@ -452,7 +472,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
@@ -554,6 +574,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
             apply_router_weight_on_input=True,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
         )
 
         self.router = Llama4MinLatencyLinear(
@@ -563,7 +584,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             dtype=model_config.pretrained_config.torch_dtype,
             quant_config=None)
 
-    def post_load_weights(self):
+    def cache_derived_state(self) -> None:
         # Set min-latency quant scales for routed experts if we plan to use min-latency MoE kernels.
         # This is because the routed experts' input scale is after the score multiplication, so we must use the
         # pre-score scaling input scale, which happens to be shared expert's input scale.
@@ -578,6 +599,9 @@ class Llama4MinLatencyMoE(Llama4MoE):
                 fc2_dequant=self.experts.fc2_dequant,
                 fc1_input_dequant=pre_score_scaling_input_scale,
             )
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def compute_routed_output(
             self,
@@ -609,15 +633,29 @@ class Llama4MinLatencyMoE(Llama4MoE):
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, hidden_states_high)
         shared_output, routed_output = maybe_execute_in_parallel(
-            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
+            fn0,
+            fn1,
+            self.moe_event[0],
+            self.moe_event[1],
+            self.aux_stream,
+            disable_on_compile=True)
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            if isinstance(shared_output, torch.Tensor):
+                output_tensor, _ = torch.ops.trtllm.allocate_output(
+                    shared_output, self.all_reduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=output_tensor)
+            else:
+                final_hidden_states = shared_output + routed_output
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states
 
 
@@ -800,18 +838,19 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
         needs_post_allreduce = self.fusion_config.POST_MOE_FUSION \
             or self.fusion_config.POST_MLP_FUSION
         if needs_post_allreduce and self.next_layer_layernorm is not None:
-            if use_fp8_allreduce and self.next_attn is not None:
+            if use_fp8_allreduce and self.next_attn is not None \
+                and hasattr(self.next_attn.qkv_proj, 'input_scale'):
                 hidden_states, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
-                            self.next_attn.qkv_proj, 'input_scale') else None,
+                        scale=self.next_attn.qkv_proj.input_scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
-            elif use_fp4_allreduce and self.next_attn is not None:
+            elif use_fp4_allreduce and self.next_attn is not None \
+                and hasattr(self.next_attn.qkv_proj, 'input_scale'):
                 act_fp4, act_sf, residual = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -819,8 +858,7 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                         RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
-                        scale=self.next_attn.qkv_proj.input_scale if hasattr(
-                            self.next_attn.qkv_proj, 'input_scale') else None,
+                        scale=self.next_attn.qkv_proj.input_scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
             else:

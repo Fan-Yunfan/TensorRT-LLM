@@ -10,8 +10,8 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 class Gemma3HfWeightMapper(HfWeightMapper):
 
     def should_skip_module(self, module_name: str) -> bool:
-        if self.model.config.tie_word_embeddings and module_name.startswith(
-                "lm_head"):
+        if getattr(self.model.config, 'tie_word_embeddings',
+                   False) and module_name.startswith("lm_head"):
             return True
 
         # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values
@@ -27,9 +27,21 @@ class Gemma3HfWeightMapper(HfWeightMapper):
         return any(skip_module in module_name
                    for skip_module in self._skip_modules)
 
-    def handle_manual_copy(self, module_name: str, module_weights: dict, n: str,
-                           p: nn.Parameter) -> None:
+    def handle_manual_copy(self,
+                           module_name: str,
+                           module_weights: dict,
+                           n: str,
+                           p: nn.Parameter,
+                           allow_partial_loading: bool = False) -> None:
         if 'norm' in module_name:
-            p.data.copy_(module_weights[n][:] + 1)
+            if not allow_partial_loading:
+                assert n in module_weights
+            if n in module_weights:
+                p.data.copy_(module_weights[n][:] + 1)
         else:
-            super().handle_manual_copy(module_name, module_weights, n, p)
+            super().handle_manual_copy(
+                module_name,
+                module_weights,
+                n,
+                p,
+                allow_partial_loading=allow_partial_loading)

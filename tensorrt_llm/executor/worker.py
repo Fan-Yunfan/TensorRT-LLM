@@ -1,61 +1,53 @@
 import gc
-import json
 import os
+import threading
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from queue import Queue
-from typing import Callable, List, Optional, Tuple, Union
+from typing import List, Optional
 
 import zmq
 
 from tensorrt_llm.logger import logger
 
-from .._utils import KVCacheEventSerializer, mpi_comm, mpi_rank
+from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
-from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs, KvCacheConnectorConfig
+from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
-from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            clear_sched_affinity, print_colored_debug,
-                            print_traceback_on_error)
-from ..lora_helper import LoraConfig
+from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
 from ..sampling_params import BatchedLogitsProcessor
-from .base_worker import BaseWorker
-from .executor import IterationResultQueue
+from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
-from .result import IterationResult
-from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    has_event_loop)
+from .rpc_worker_mixin import RpcWorkerMixin
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs)
+from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
     "GenerationExecutorWorker",
 ]
 
 
-class GenerationExecutorWorker(BaseWorker):
-
-    class WorkerExit(GeneratorExit):
-        pass
+class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
+        rpc_addr: Optional[str] = None,
+        hmac_key: bytes = b"",
     ) -> None:
         super().__init__(
             engine=engine,
@@ -63,135 +55,52 @@ class GenerationExecutorWorker(BaseWorker):
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
             llm_args=llm_args,
         )
 
+        if (self.llm_args is not None
+                and getattr(self.llm_args, "enable_resource_governor", False)):
+            self._resource_governor_queue = IntraProcessQueue()
+
         self.setup_engine()
+
+        # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
+        # Only set up if rpc_addr is provided (for stats RPC support)
+        if rpc_addr is not None:
+            assert hmac_key, "hmac_key is required when rpc_addr is set"
+            self.rpc_addr = rpc_addr
+            self.hmac_key = hmac_key
+            self.start_rpc_server()  # Reuse from RpcWorkerMixin
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
             error_queue=self._error_queue,
             name="await_response_thread")
 
-        self.dispatch_stats_thread = ManagedThread(
-            self.dispatch_stats_task,
-            error_queue=self._error_queue,
-            name="dispatch_stats_thread")
-
-        self.dispatch_kv_cache_events_thread = ManagedThread(
-            self.dispatch_kv_cache_events_task,
-            error_queue=self._error_queue,
-            name="dispatch_kv_cache_events_thread")
-
-    def _create_iteration_result_queue(self,
-                                       it_result_queue: IterationResultQueue):
-        if not it_result_queue.is_initialized:
-            # not yet initialized
-            it_result_queue.is_initialized = True
-            if has_event_loop():
-                _queue = AsyncQueue()
-                it_result_queue.queue = _queue.sync_q
-                it_result_queue.aqueue = _queue
-            else:
-                _queue = Queue()
-                it_result_queue.queue = _queue
-                it_result_queue.aqueue = None
-
     def start_thread(self, thread: ManagedThread):
-        if self.engine.can_enqueue_requests() and not thread.is_alive():
-            thread.start()
+        if not self.engine.can_enqueue_requests():
+            return
+        if thread.is_alive():
+            return
+        if thread.ident is not None:
+            # Already exited: either stop() at shutdown (nothing to surface) or
+            # an engine event-loop crash, where restarting masks it into a peer
+            # MPI-collective hang. Wrap, since start() runs on every submit().
+            err = getattr(self.engine, "_event_loop_error", None)
+            if err is not None:
+                raise RequestError(str(err)) from err
+            return
+        thread.start()
 
     def await_response_task(self) -> bool:
         return self._await_response_helper()
 
-    def _iteration_result_task(self, it_result_queue: IterationResultQueue,
-                               engine_get_result_api: Callable,
-                               result_singleton: IterationResult,
-                               result_serializer: Callable) -> bool:
-        time.sleep(0.2)
-        async_queues = []
-        queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
-        try:
-            for results in engine_get_result_api():
-                res = result_serializer(results)
-                if self._is_llm_executor and result_singleton:
-                    # In this case, there's no ExecutorBindingProxy.
-                    # Worker needs to take care of putting to result queue.
-                    while queue.full():
-                        queue.get()
-                    if isinstance(queue, _SyncQueue):
-                        queue.put_nowait(res)
-                        async_queues.append(queue)
-                    else:
-                        queue.put(res)
-                else:
-                    # Send to ExecutorBindingProxy via IPC
-                    queue.put(res)
-
-            if async_queues:
-                _SyncQueue.notify_many(queue.loop, async_queues)
-        except AsyncQueue.EventLoopShutdownError:
-            # This happens in the last results loop while the generate workflow is stopped.
-            logger.debug("worker.py: EventLoopShutdownError")
-        except Exception as e:
-            logger.error(f"worker.py: Error in _iteration_result_task: {e}")
-            raise e
-
-        return True  # success
-
-    def dispatch_stats_task(self) -> bool:
-
-        # Define a Callable to join iteration and request stats
-        def stats_serializer(
-                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-            iteration_stats, req_stats = stats
-            stats_dict = json.loads(iteration_stats.to_json_str())
-
-            if req_stats is not None and len(req_stats) > 0:
-                stats_dict["requestStats"] = []
-                for req_stat in req_stats:
-                    stats_dict["requestStats"].append(
-                        json.loads(req_stat.to_json_str()))
-
-            # Convert back to JSON string
-            return json.dumps(stats_dict)
-
-        return self._iteration_result_task(self.stats_queues, self.fetch_stats,
-                                           self._iter_stats_result,
-                                           stats_serializer)
-
-    def dispatch_kv_cache_events_task(self) -> bool:
-        if isinstance(self.engine, tllm.Executor):
-            # Check if the engine has a kv cache event manager
-            # If not, return an empty list for the events which will cause the thread to exit early.
-            event_manager = self.engine.get_kv_cache_event_manager()
-            if event_manager is None:
-                events_api = lambda: [None]
-            else:
-                events_api = event_manager.get_latest_events
-            return self._iteration_result_task(
-                self.kv_events_queues, events_api, self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
-        else:
-            return self._iteration_result_task(
-                self.kv_events_queues, self.engine.get_latest_kv_cache_events,
-                self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
-
     def start(self):
-        # create iteration result queues
-        self._create_iteration_result_queue(self.stats_queues)
-        self._create_iteration_result_queue(self.kv_events_queues)
-
-        # start threads
+        # Stats and KV events are now fetched on-demand via RPC,
+        # so we only need to start the response thread
         self.start_thread(self.await_response_thread)
-        self.start_thread(self.dispatch_kv_cache_events_thread)
-        if mpi_rank() == 0:
-            self.start_thread(self.dispatch_stats_thread)
 
     def shutdown(self):
 
@@ -200,20 +109,13 @@ class GenerationExecutorWorker(BaseWorker):
         else:
             self.doing_shutdown = True
 
-        print_colored_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+        logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
-
                 if self.await_response_thread.is_alive():
                     self.await_response_thread.stop()
                     self.await_response_thread.join()
-                if self.dispatch_stats_thread.is_alive():
-                    self.dispatch_stats_thread.stop()
-                    self.dispatch_stats_thread.join()
-                if self.dispatch_kv_cache_events_thread.is_alive():
-                    self.dispatch_kv_cache_events_thread.stop()
-                    self.dispatch_kv_cache_events_thread.join()
 
             self.engine.shutdown()
             self.engine = None
@@ -232,30 +134,44 @@ class GenerationExecutorWorker(BaseWorker):
                     self._executor_config.checkpoint_loader.cleanup()
                     self._executor_config.checkpoint_loader = None
 
+        # Destroy torch distributed process groups so that NCCL communicators
+        # are torn down cleanly before MPI session shutdown and process exit.
+        # This is done here (not in PyExecutor.shutdown()) because the MPI
+        # worker owns the process group.  In the Ray path the process group
+        # belongs to RayWorkerWrapper and must not be destroyed by the engine.
+        import torch.distributed
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+        # Return this rank's GPU memory to the driver. Under an external MPI
+        # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+        # shared across successive LLM instances: a new GenerationExecutorWorker
+        # is built for each LLM, but the OS process -- and with it the CUDA
+        # context and PyTorch caching allocator -- persists. Setting
+        # `self.engine = None` above is not enough to free the GPU: reference
+        # cycles keep the model tensors alive until a later GC, and the allocator
+        # holds freed blocks as "reserved" instead of returning them. Without
+        # this, the previous model's ~weights-sized reservation carries into the
+        # next LLM built in this process and can OOM its load (e.g. back-to-back
+        # tests in one CI shard).
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
-        print_colored_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
+        logger_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
 
     def block_subordinates(self):
         if self.rank != 0:
-            if isinstance(self.engine, tllm.Executor):
-                self.shutdown()
-                raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
-                )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
 
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        self.shutdown()
-        return exc_type is None or exc_type == GenerationExecutorWorker.WorkerExit
-
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -265,33 +181,57 @@ def worker_main(
     _torch_model_class_mapping: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
+    worker_process_identities_signal: Optional[bytes] = None,
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
-    lora_config: Optional[LoraConfig] = None,
-    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     hf_model_dir: Optional[Path] = None,
     tokenizer: Optional[TokenizerBase] = None,
     llm_args: Optional[BaseLlmArgs] = None,
+    rpc_addr: Optional[str] = None,
+    hmac_key: bytes = b"",
 ) -> None:
-    mpi_comm().barrier()
-    print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
-                        "green")
 
-    pid = os.getpid()
-    cpus = os.sched_getaffinity(pid)
-    if cpus:
-        logger.warning(
-            f"Found worker process {pid} was bound to {cpus}, this may harm "
-            "performance.", )
-        logger.warning(f"Will clear the cpu affinity")
-        clear_sched_affinity(pid)
+    def _print_stacks():
+        counter = 0
+        while True:
+            time.sleep(print_stacks_period)
+            counter += 1
+            logger.error(f"Printing stacks {counter} times")
+            print_all_stacks()
+
+    print_stacks_period = int(
+        os.getenv("TRTLLM_WORKER_PRINT_STACKS_PERIOD", "-1"))
+    if print_stacks_period > 0:
+        print_stacks_thread = threading.Thread(target=_print_stacks,
+                                               daemon=True)
+        print_stacks_thread.start()
+
+    mpi_comm().barrier()
+
+    if llm_args is not None and llm_args.env_overrides:
+        # this is needed because MPI_Init seems to cache the env at import time.
+        # The cached env snapshot is used to spawn workers.
+        # Any env overrides to the main process after tensorrt_llm import
+        # may not get reflected in the spawned worker process, no matter how early,
+        # unless we update it explicitly here.
+        os.environ.update(llm_args.env_overrides)
+
+    if llm_args is not None and llm_args.trust_remote_code:
+        _init_hf_modules()
+
+    logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    resource_governor_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
     is_leader: bool = mpi_rank() == 0
+    # Multi-frontend serving: the worker binds the request ingress (PULL)
+    # and pushes responses to per-frontend result lanes.
+    multi_frontend_addrs = worker_queues.frontend_result_queue_addrs
+    frontend_result_queues: Optional[List[FusedIpcQueue]] = None
     if tracer_init_kwargs is not None and is_leader:
         tracer = VizTracer(**tracer_init_kwargs)
         tracer.register_exit()
@@ -299,7 +239,8 @@ def worker_main(
         set_global_tracer(tracer)
 
     if _torch_model_class_mapping is not None:
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
         MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
 
     set_mpi_session_cpp(mpi_comm())
@@ -309,22 +250,20 @@ def worker_main(
         # inherit the log level from "TLLM_LOG_LEVEL" environment variable
         logger.set_level(log_level)
         request_queue = IpcQueue(worker_queues.request_queue_addr,
-                                 is_server=False,
+                                 is_server=multi_frontend_addrs is not None,
+                                 socket_type=zmq.PULL if multi_frontend_addrs
+                                 is not None else zmq.PAIR,
                                  name="worker_request_queue")
         worker_init_status_queue = IpcQueue(
             worker_queues.worker_init_status_queue_addr,
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
-        mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
-                                       is_server=False,
-                                       fuse_message=True,
-                                       name="worker_stats_queue")
-        kv_cache_events_queue = FusedIpcQueue(
-            worker_queues.kv_cache_events_queue_addr,
+        resource_governor_queue = IpcQueue(
+            worker_queues.resource_governor_queue_addr,
             is_server=False,
-            fuse_message=False,
-            name="worker_kv_cache_events_queue")
+            name="worker_resource_governor_queue"
+        ) if worker_queues.resource_governor_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -335,6 +274,16 @@ def worker_main(
                               name=f"postprocess_{i}_feedin_queue")
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
+        elif multi_frontend_addrs is not None:
+            # One PUSH lane per frontend (see base_worker._send_rsp).
+            frontend_result_queues = [
+                FusedIpcQueue(addr,
+                              is_server=False,
+                              fuse_message=False,
+                              socket_type=zmq.PUSH,
+                              name=f"worker_result_queue_{i}")
+                for i, addr in enumerate(multi_frontend_addrs)
+            ]
         else:
             # IPC queue for sending results back to the proxy, and let the
             # Proxy process to handle the postprocess
@@ -344,35 +293,38 @@ def worker_main(
                                          name="worker_result_queue")
 
     def notify_proxy_threads_to_quit():
-        # Signal the dispatcher thread in the proxy to quit
+        # Signal the dispatcher thread in every frontend proxy to quit
         if result_queue is not None:
             result_queue.put(None)
+        elif frontend_result_queues is not None:
+            for q in frontend_result_queues:
+                q.put(None)
         else:
             assert result_queues is not None
             for q in result_queues:
                 q.put(None)
-        # Signal the stats thread in the proxy to quit
-        mp_stats_queue.put(None)
-        kv_cache_events_queue.put(None)
 
     postprocess_worker_futures = []
     if is_leader and postproc_worker_config.enabled:
-        print_colored_debug(f"initiate postprocess workers...", "yellow")
+        logger_debug(f"initiate postprocess workers...", "yellow")
 
-        proxy_result_queue: tuple[
-            str, Optional[bytes]] = worker_queues.result_queue_addr
+        # Each postproc worker pushes to every frontend result lane (a
+        # single lane in single-frontend mode).
+        proxy_result_addrs = (multi_frontend_addrs
+                              if multi_frontend_addrs is not None else
+                              [worker_queues.result_queue_addr])
 
         assert result_queues is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
-        assert isinstance(proxy_result_queue, tuple)
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
                 result_queues[i].address,
-                proxy_result_queue,
+                proxy_result_addrs,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 
@@ -388,8 +340,24 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
-    print_colored_debug(f"Worker {mpi_rank()} ready to setup backend...\n",
-                        "green")
+    worker_process_identities = mpi_comm().allgather(
+        capture_worker_process_identity(mpi_rank()))
+
+    # Publish the process identities before backend construction begins. Model
+    # construction can load weights for several minutes, and an externally
+    # killed worker may not complete its MPI future. Registering the workers at
+    # this point lets the proxy observe such a death while it is still waiting
+    # for the READY signal.
+    if is_leader and worker_process_identities_signal is not None:
+        identities_msg = (worker_process_identities_signal, None,
+                          worker_process_identities)
+        if not worker_init_status_queue.notify_with_retry(identities_msg):
+            # The failed status queue cannot report its own failure. Let this
+            # escape through the MPI future so the proxy can observe it.
+            raise RuntimeError(
+                "Failed to deliver worker process identities to proxy")
+
+    logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
         worker: GenerationExecutorWorker = worker_cls(
@@ -398,15 +366,15 @@ def worker_main(
             batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            kv_connector_config=kv_connector_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,
-            llm_args=llm_args)
+            llm_args=llm_args,
+            rpc_addr=rpc_addr,
+            hmac_key=hmac_key)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
-        print_colored_debug(f"error: {traceback.format_exc()}", "red")
+        logger_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
             # Send error message with confirmation
             error_msg = (e, traceback.format_exc())
@@ -425,20 +393,24 @@ def worker_main(
             if is_leader:
                 if postproc_worker_config.enabled:
                     worker.set_postproc_queues(result_queues)
+                elif frontend_result_queues is not None:
+                    worker.set_frontend_result_queues(frontend_result_queues)
                 else:
                     worker.set_result_queue(result_queue)
 
-                # initialize the iteration result queues
-                worker._set_iteration_result_queue(worker.stats_queues,
-                                                   mp_stats_queue)
-                worker._set_iteration_result_queue(worker.kv_events_queues,
-                                                   kv_cache_events_queue)
                 # Send ready signal with confirmation
-                ready_msg = (ready_signal, None)
+                ready_msg = (ready_signal, None, worker_process_identities)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
+                if resource_governor_queue is not None:
+                    # Swap rank 0 to the proxy IPC queue after construction.
+                    # The resource-governor flag is already enabled on all
+                    # ranks.
+                    worker.engine.set_resource_governor_queue(
+                        resource_governor_queue)
+
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)

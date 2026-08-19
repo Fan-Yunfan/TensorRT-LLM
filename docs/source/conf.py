@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # Configuration file for the Sphinx documentation builder.
 #
 # For the full list of built-in configuration values, see the documentation:
@@ -15,6 +18,7 @@ import pygit2
 from docutils import nodes
 
 sys.path.insert(0, os.path.abspath('.'))
+sys.path.insert(0, os.path.abspath('_ext'))
 
 project = 'TensorRT LLM'
 copyright = '2025, NVidia'
@@ -43,6 +47,13 @@ version = version_module.__version__
 templates_path = ['_templates']
 exclude_patterns = ['performance/performance-tuning-guide/introduction.md']
 
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+CPP_XML_INDEX = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "cpp_docs", "xml", "index.xml"))
+HAS_CPP_XML = os.path.exists(CPP_XML_INDEX)
+if not HAS_CPP_XML:
+    exclude_patterns.append('_cpp_gen/**')
+
 extensions = [
     'sphinx.ext.duration',
     'sphinx.ext.autodoc',
@@ -51,7 +62,6 @@ extensions = [
     'sphinx.ext.napoleon',
     'sphinx.ext.mathjax',
     'myst_parser',  # for markdown support
-    "breathe",
     'sphinx.ext.todo',
     'sphinx.ext.autosectionlabel',
     'sphinxarg.ext',
@@ -59,7 +69,14 @@ extensions = [
     'sphinx_copybutton',
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
+    'sphinxcontrib.mermaid',
+    'trtllm_auto_deploy',
+    'llmapi_config_telemetry',
+    'trtllm_config_selector',
 ]
+
+if HAS_CPP_XML:
+    extensions.append("breathe")
 
 autodoc_member_order = 'bysource'
 autodoc_pydantic_model_show_json = True
@@ -88,6 +105,7 @@ myst_enable_extensions = [
     "substitution",
     "dollarmath",
     "amsmath",
+    "html_inline",
 ]
 
 myst_substitutions = {
@@ -140,12 +158,11 @@ html_theme_options = {
     ]
 }
 
-# ------------------------  C++ Doc related  --------------------------
-# Breathe configuration
-breathe_default_project = "TensorRT-LLM"
-breathe_projects = {"TensorRT-LLM": "../cpp_docs/xml"}
-
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if HAS_CPP_XML:
+    breathe_default_project = "TensorRT-LLM"
+    breathe_projects = {"TensorRT-LLM": "../cpp_docs/xml"}
+else:
+    breathe_projects = {}
 
 CPP_INCLUDE_DIR = os.path.join(SCRIPT_DIR, '../../cpp/include/tensorrt_llm')
 CPP_GEN_DIR = os.path.join(SCRIPT_DIR, '_cpp_gen')
@@ -169,11 +186,25 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 def setup(app):
     from helper import generate_examples, generate_llmapi, update_version
 
+    # `import tensorrt_llm` pulls in the compiled bindings, which link against
+    # libcuda.so.1. On a driverless (CPU) doc-build node that resolves only if
+    # the CUDA driver stub is on LD_LIBRARY_PATH (see
+    # scripts/cuda_driver_stub.py, exported before `make html`). A failed import
+    # yields incomplete API docs, so in CI (TRTLLM_DOCS_REQUIRE_IMPORT=1) treat
+    # it as a hard failure instead of a silent warning; a local doc-only build
+    # without the wheel still degrades gracefully.
+    require_import = os.environ.get("TRTLLM_DOCS_REQUIRE_IMPORT") == "1"
     try:
         from tensorrt_llm.llmapi.utils import tag_llm_params
         tag_llm_params()
-    except ImportError:
-        print("Warning: tensorrt_llm not available, skipping tag_llm_params")
+        print("tensorrt_llm imported successfully; applied tag_llm_params")
+    except ImportError as e:
+        msg = f"tensorrt_llm not importable, API docs would be incomplete: {e}"
+        if require_import:
+            raise RuntimeError(
+                "tensorrt_llm not importable, API docs would be incomplete"
+            ) from e
+        print(f"Warning: {msg}; skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
 
@@ -206,10 +237,11 @@ Runtime
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
-# compile cpp doc
-subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
-gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
-            runtime_summary)
+if HAS_CPP_XML:
+    # compile cpp doc
+    subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+    gen_cpp_doc(CPP_GEN_DIR + '/runtime.rst', CPP_INCLUDE_DIR + '/runtime',
+                runtime_summary)
 
 executor_summary = f"""
 Executor
@@ -220,6 +252,7 @@ Executor
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
     """.strip()
 
-subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
-gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
-            executor_summary)
+if HAS_CPP_XML:
+    subprocess.run(['mkdir', '-p', CPP_GEN_DIR])
+    gen_cpp_doc(CPP_GEN_DIR + '/executor.rst', CPP_INCLUDE_DIR + '/executor',
+                executor_summary)

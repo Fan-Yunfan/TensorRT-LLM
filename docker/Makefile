@@ -47,7 +47,6 @@ CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
 NCCL_VERSION       ?=
 CUBLAS_VERSION     ?=
-TRT_VERSION        ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
@@ -75,8 +74,16 @@ define rewrite_tag
 $(shell echo $(IMAGE_WITH_TAG) | sed "s/\/tensorrt-llm:/\/tensorrt-llm-staging:/g")
 endef
 
+base_pull:
+	@echo "Pulling base image: $(BASE_IMAGE):$(BASE_TAG)"
+	docker pull $(BASE_IMAGE):$(BASE_TAG)
+
 %_build: DEVEL_IMAGE = $(if $(findstring 1,$(JENKINS_DEVEL)),$(shell . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE))
-%_build:
+%_build: SH_ENV      = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+				  	   | grep '^ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: BASH_ENV    = $(shell docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' $(BASE_IMAGE):$(BASE_TAG) \
+    				   | grep '^BASH_ENV=' | sed 's/^[^=]*=//' 2>/dev/null)
+%_build: base_pull
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
@@ -91,12 +98,13 @@ endef
 		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \
 		$(if $(NCCL_VERSION), --build-arg NCCL_VER="$(NCCL_VERSION)") \
 		$(if $(CUBLAS_VERSION), --build-arg CUBLAS_VER="$(CUBLAS_VERSION)") \
-		$(if $(TRT_VERSION), --build-arg TRT_VER="$(TRT_VERSION)") \
 		$(if $(TRT_LLM_VERSION), --build-arg TRT_LLM_VER="$(TRT_LLM_VERSION)") \
 		$(if $(DEVEL_IMAGE), --build-arg DEVEL_IMAGE="$(DEVEL_IMAGE)") \
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
 		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
+		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
+		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -192,16 +200,21 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 13.0.0-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 13.2.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-rockylinux8_%: BASE_TAG = 13.0.0-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 13.2.1-devel-rockylinux8
 
-# For x86_64 and aarch64
+# For x86_64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu22_%: BASE_TAG = 13.0.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 13.2.1-devel-ubuntu22.04
+
+# For x86_64 and aarch64
+ubuntu24_%: STAGE = tritondevel
+ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
+ubuntu24_%: BASE_TAG = 13.2.1-devel-ubuntu24.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

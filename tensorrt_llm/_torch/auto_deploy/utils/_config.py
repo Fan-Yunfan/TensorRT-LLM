@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Helper functions for config-related settings."""
 
 import os
@@ -5,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from omegaconf import DictConfig, OmegaConf
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, YamlConfigSettingsSource
 from pydantic_settings.sources.types import DEFAULT_PATH, PathType
 
@@ -41,7 +55,8 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
                 "specify the `yaml_default` field in your pydantic model instead."
             )
 
-    def _read_files(self, files: PathType | None) -> dict[str, Any]:
+    def _read_files(self, files: PathType | None, **kwargs: Any) -> dict[str, Any]:
+        """Read and deep-merge YAML files. Accepts deep_merge kwarg for parent API compatibility."""
         if files is None:
             return {}
         if isinstance(files, (str, os.PathLike)):
@@ -124,7 +139,7 @@ class DynamicYamlMixInForSettings:
           settings.
     - Explicitly initialized fields for inner settings take precedence over outer yaml configs for
       inner settings since they are provided as init arguments.
-    - Check out ``tests/unittest/_torch/auto_deploy/unit/singlegpu/utils/test_config.py`` for more
+    - Check out ``tests/unittest/auto_deploy/singlegpu/utils/test_config.py`` for more
       examples.
 
 
@@ -161,23 +176,6 @@ class DynamicYamlMixInForSettings:
         'with higher priority. "Later" files have higher priority. Should be used with care!',
     )
 
-    # TODO: remove this field in a future version
-    yaml_configs: List[PathType] = Field(
-        default_factory=list,
-        description="DEPRECATED: Please use yaml_extra instead.",
-    )
-
-    @field_validator("yaml_configs")
-    @classmethod
-    def validate_yaml_configs_deprecated(cls, v):
-        """Throw error that yaml_configs is deprecated in favor of yaml_extra."""
-        if v:  # Only raise error if the field is actually being used (not empty)
-            raise ValueError(
-                "The 'yaml_configs' field is deprecated and no longer supported. "
-                "Please use 'yaml_extra' instead."
-            )
-        return v
-
     @model_validator(mode="after")
     def validate_mode_and_yaml_default_not_both_provided(self):
         """Validate that both mode and yaml_default are not provided simultaneously.
@@ -207,6 +205,7 @@ class DynamicYamlMixInForSettings:
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         """Customise settings sources."""
         deferred_yaml_settings = DynamicYamlWithDeepMergeSettingsSource(settings_cls)
+        env_settings.env_prefix = "AD_"  # NOTE: set prefix to avoid conflicts with other env vars
         return (
             init_settings,
             env_settings,

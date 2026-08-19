@@ -40,7 +40,8 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
     SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig, std::optional<Tensor> skipCrossAttnBlocks,
     std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs, std::optional<CacheSaltIDType> cacheSaltID)
+    std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
+    std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(externalDraftTokensConfig), std::move(pTuningConfig), std::move(multimodalInput),
@@ -49,7 +50,7 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength, crossAttentionMask,
         numReturnSequences, eagleConfig, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid,
-        allottedTimeMs, cacheSaltID))
+        allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
 
@@ -76,6 +77,11 @@ Request& Request::operator=(Request&& other) noexcept = default;
 VecTokens Request::getInputTokenIds() const
 {
     return mImpl->getInputTokenIds();
+}
+
+SizeType32 Request::getNumInputTokens() const
+{
+    return mImpl->getNumInputTokens();
 }
 
 SizeType32 Request::getMaxTokens() const
@@ -248,9 +254,14 @@ std::optional<SizeType32> Request::getLanguageAdapterUid() const
     return mImpl->getLanguageAdapterUid();
 }
 
-std::optional<CacheSaltIDType> Request::getCacheSaltID() const
+std::optional<std::string> Request::getCacheSalt() const
 {
-    return mImpl->getCacheSaltID();
+    return mImpl->getCacheSalt();
+}
+
+std::optional<IdType> Request::getDisaggRequestId() const
+{
+    return mImpl->getDisaggRequestId();
 }
 
 void Request::setStreaming(bool streaming)
@@ -310,12 +321,12 @@ void Request::setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
 
 void Request::setMultimodalEmbedding(Tensor const& multimodalEmbedding)
 {
-    return mImpl->setMultimodalEmbedding(multimodalEmbedding);
+    mImpl->setMultimodalEmbedding(multimodalEmbedding);
 }
 
 void Request::setMultimodalInput(MultimodalInput const& multimodalInput)
 {
-    return mImpl->setMultimodalInput(multimodalInput);
+    mImpl->setMultimodalInput(multimodalInput);
 }
 
 void Request::setMropeConfig(MropeConfig const& mRopeConfig)
@@ -400,7 +411,7 @@ void Request::setEagleConfig(std::optional<EagleConfig> const& eagleConfig)
 
 void Request::setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
 {
-    return mImpl->setSkipCrossAttnBlocks(skipCrossAttnBlocks);
+    mImpl->setSkipCrossAttnBlocks(skipCrossAttnBlocks);
 }
 
 void Request::setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams)
@@ -410,16 +421,21 @@ void Request::setGuidedDecodingParams(GuidedDecodingParams const& guidedDecoding
 
 void Request::setAllottedTimeMs(MillisecondsType allottedTimeMs)
 {
-    return mImpl->setAllottedTimeMs(allottedTimeMs);
+    mImpl->setAllottedTimeMs(allottedTimeMs);
 }
 
 void Request::setLanguageAdapterUid(SizeType32 languageAdapterUid)
 {
-    return mImpl->setLanguageAdapterUid(languageAdapterUid);
+    mImpl->setLanguageAdapterUid(languageAdapterUid);
 }
 
-void Request::setCacheSaltID(CacheSaltIDType cacheSaltID)
+void Request::setCacheSalt(std::optional<std::string> cacheSalt)
 {
-    return mImpl->setCacheSaltID(cacheSaltID);
+    mImpl->setCacheSalt(std::move(cacheSalt));
+}
+
+void Request::setDisaggRequestId(IdType disaggRequestId)
+{
+    mImpl->setDisaggRequestId(disaggRequestId);
 }
 } // namespace tensorrt_llm::executor
